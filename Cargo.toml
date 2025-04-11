@@ -1,11 +1,16 @@
 [package]
-name = "trial"
+name = "linux-task-manager"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 sysinfo = "0.34.2"
 crossterm = "0.28.1"
 ratatui = "0.29.0"
 color-eyre = "0.6.3"
+cli-table = "0.5"
+nix = { version = "0.27.1", features = ["signal", "process"] }  # Add feature flags
 
+[[bin]]
+name = "linux-task-manager"
+path = "src/main.rs"
