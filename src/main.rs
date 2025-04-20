@@ -203,10 +203,6 @@ fn system_info(sys: &sysinfo::System) -> Table {
     "System OS Version:",
     "System Host Name:",
     "NB CPUs:",
-    "Total Memory:",
-    "Used Memory:",
-    "Total Swap:",
-    "Used Swap"
     ];
 
     let sys_values = vec![
@@ -215,10 +211,6 @@ fn system_info(sys: &sysinfo::System) -> Table {
         System::os_version().unwrap_or("Unknown".to_string()),
         System::host_name().unwrap_or("Unknown".to_string()),
         format!("{}", sys.cpus().len()),
-        format!("{}", sys.total_memory() / (1024*1024)),
-        format!("{}", sys.used_memory() / (1024*1024)),
-        format!("{}", sys.total_swap() / (1024*1024)),
-        format!("{}", sys.used_swap() / (1024*1024))
     ];
 
     let rows: Vec<Row> = sys_titles.iter().zip(sys_values.iter()).map(|(title, value)|{
@@ -228,8 +220,8 @@ fn system_info(sys: &sysinfo::System) -> Table {
 
 
     Table::new(rows,
-        &[ratatui::layout::Constraint::Percentage(35), 
-        ratatui::layout::Constraint::Percentage(65)])
+        &[ratatui::layout::Constraint::Percentage(50), 
+        ratatui::layout::Constraint::Percentage(50)])
         .block(
             Block::default()
                 .title(Span::styled(
@@ -240,24 +232,74 @@ fn system_info(sys: &sysinfo::System) -> Table {
                    
 }
 
+fn usage_info(sys: &sysinfo::System) -> Table {
+    let sys_titles = vec![
+    "Total Memory:",
+    "Used Memory:",
+    "Total Swap:",
+    "Used Swap:"
+    ];
+
+    let sys_values = vec![
+        format!("{} MB", sys.total_memory() / (1024*1024)),
+        format!("{} MB", sys.used_memory() / (1024*1024)),
+        format!("{} MB", sys.total_swap() / (1024*1024)),
+        format!("{} MB", sys.used_swap() / (1024*1024))
+    ];
+
+    let rows: Vec<Row> = sys_titles.iter().zip(sys_values.iter()).map(|(title, value)|{
+        Row::new(vec![Cell::from(Span::raw(*title)),
+                            Cell::from(Span::raw(value.clone())),])
+    }).collect();
+
+
+    Table::new(rows,
+        &[ratatui::layout::Constraint::Percentage(65), 
+        ratatui::layout::Constraint::Percentage(35)])
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    "Usage Info", 
+                    Style::default().add_modifier(Modifier::BOLD)
+                ))
+                .borders(Borders::ALL))
+                   
+}
+
 fn cpu_info(sys: &sysinfo::System) -> Table{
 
-    let rows: Vec<Row> = sys.cpus().iter().enumerate().map(|(idx, cpu)|{
-        Row::new(vec![Cell::from(Span::raw(format!("CPU {}:", idx))),
-                            Cell::from(Span::raw(format!("{:.2}%", cpu.cpu_usage()))),
-                            ])}).collect();
+    let mut rows: Vec<Row> = sys.cpus().chunks(2).enumerate().map(|(chunk_idx, chunk)|{
+        
+        let mut cells = Vec::new();
+
+        for(i, cpu) in chunk.iter().enumerate(){
+            let idx = chunk_idx * 2 + i;
+            cells.push(Cell::from(Span::raw(format!("CPU {}:", idx))));
+            cells.push(Cell::from(Span::raw(format!("{:.2}%", cpu.cpu_usage()))));
+        }
+        
+        Row::new(cells)
+
+    }).collect();
+
+    let footer = Row::new(vec![
+        Cell::from(Span::raw("Average CPU Usage")),
+        Cell::from(Span::raw(format!("{:.2}%", sys.global_cpu_usage()))),
+    ]);
 
     // go back to see dimensions
     Table::new(rows,
-        &[ratatui::layout::Constraint::Length(10), 
-        ratatui::layout::Constraint::Length(10)])
+        &[ratatui::layout::Constraint::Percentage(20), 
+        ratatui::layout::Constraint::Percentage(30),
+        ratatui::layout::Constraint::Percentage(20),
+        ratatui::layout::Constraint::Percentage(30)])
         .block(
             Block::default()
                 .title(Span::styled(
                     "Per CPU usage", 
                     Style::default().add_modifier(Modifier::BOLD)
                 ))
-                .borders(Borders::ALL))
+                .borders(Borders::ALL)).footer(footer)
 }
 
 fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<'a> {
@@ -413,31 +455,51 @@ fn main() -> io::Result<()> {
                 let layout = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(10),  // System stats
-                    Constraint::Length(20),  // cpu info
+                    Constraint::Length(12),  // System stats
+                    // Constraint::Length(20),  // cpu info
                     Constraint::Length(20),  // Help panel 
                     Constraint::Min(5),      // Process list
                 ])
                 .split(frame.area());
 
-                frame.render_widget(system_info(&sys), layout[0]);
-                frame.render_widget(cpu_info(&sys), layout[1]);
-                frame.render_widget(help_panel(), layout[2]);
-                frame.render_widget(process_list(&sys, &mut state), layout[3]);
+                let upper_list_layout = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(vec![
+                    Constraint::Percentage(36),
+                    Constraint::Percentage(25),
+                    Constraint::Percentage(39),
+                ])
+                .split(layout[0]);
+
+                frame.render_widget(system_info(&sys), upper_list_layout[0]);
+                frame.render_widget(usage_info(&sys), upper_list_layout[1]);
+                frame.render_widget(cpu_info(&sys), upper_list_layout[2]);
+                frame.render_widget(help_panel(), layout[1]);
+                frame.render_widget(process_list(&sys, &mut state), layout[2]);
             } else {
                 // Standard layout without help
                 let layout = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(10), // System stats
-                        Constraint::Length(20),  // cpu info
+                        Constraint::Length(12), // System stats
+                        // Constraint::Length(20),  // cpu info
                         Constraint::Min(5),     // Process list
                     ])
                     .split(frame.area());
 
-                frame.render_widget(system_info(&sys), layout[0]);
-                frame.render_widget(cpu_info(&sys), layout[1]);
-                frame.render_widget(process_list(&sys, &mut state), layout[2]);
+                let upper_list_layout = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(vec![
+                    Constraint::Percentage(36),
+                    Constraint::Percentage(25),
+                    Constraint::Percentage(39),
+                ])
+                .split(layout[0]);
+
+                frame.render_widget(system_info(&sys), upper_list_layout[0]);
+                frame.render_widget(usage_info(&sys), upper_list_layout[1]);
+                frame.render_widget(cpu_info(&sys), upper_list_layout[2]);
+                frame.render_widget(process_list(&sys, &mut state), layout[1]);
             }
         })?;
 
