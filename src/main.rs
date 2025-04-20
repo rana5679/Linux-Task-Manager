@@ -6,6 +6,7 @@ use ratatui::{
     widgets::*,
     style::{Style, Modifier, Color},
     text::{Span, Line},
+    symbols,
 };
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid as NixPid;
@@ -28,6 +29,7 @@ struct AppState {
     selected_index: usize,  // Added for process selection
     show_help: bool,        // Added for help panel toggle
     killed_pids: Vec<Pid>, // Track killed processes
+    g1_data: Vec<(f64, f64)>, // track data points for graph 1
 }
 
 impl AppState {
@@ -41,6 +43,7 @@ impl AppState {
             selected_index: 0,
             show_help: false,
             killed_pids: Vec::new(), 
+            g1_data: Vec::new(),
         }
     }
 
@@ -428,6 +431,51 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
     .column_spacing(1)
 }
 
+fn cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState) ->Chart<'a>{
+    let new_x = app.g1_data.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
+    let new_y = sys.global_cpu_usage() as f64;
+
+    app.g1_data.push((new_x, new_y));
+
+
+    let dataset = Dataset::default()
+    .data(&app.g1_data)
+    .graph_type(GraphType::Bar)
+    .marker(symbols::Marker::Braille);
+
+
+    let x_bounds = if app.g1_data.len() > 10 {
+        [app.g1_data[0].0, app.g1_data.last().unwrap().0]
+    } else {
+        [0.0, 10.0] // Default if < 2 points
+    };
+
+
+    // Configure axes
+    let x_axis = Axis::default()
+        .title("Time")
+        .bounds(x_bounds);
+
+    let y_axis = Axis::default()
+        .title("CPU %")
+        .bounds([0.0, 100.0]);
+        //.labels(vec!["0".into(), "50".into(), "100".into()]);
+
+    // Build chart with both axes
+    Chart::new(vec![dataset])
+        .x_axis(x_axis)
+        .y_axis(y_axis) 
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    "Per CPU usage", 
+                    Style::default().add_modifier(Modifier::BOLD)
+                ))
+                .borders(Borders::ALL)
+                .style(Style::default().bg(Color::Black)))
+
+}
+
 fn main() -> io::Result<()> {
     // Initialize terminal
     let mut terminal = ratatui::init();
@@ -439,6 +487,7 @@ fn main() -> io::Result<()> {
     // Give system time to collect baseline metrics
     sys.refresh_all();
     std::thread::sleep(std::time::Duration::from_millis(500));
+
 
     loop {
         // Only refresh if not frozen
@@ -471,6 +520,10 @@ fn main() -> io::Result<()> {
                 ])
                 .split(layout[0]);
 
+                let background = Block::default()
+                .style(Style::default().bg(Color::Black));
+                frame.render_widget(background, frame.area());
+
                 frame.render_widget(system_info(&sys), upper_list_layout[0]);
                 frame.render_widget(usage_info(&sys), upper_list_layout[1]);
                 frame.render_widget(cpu_info(&sys), upper_list_layout[2]);
@@ -481,9 +534,9 @@ fn main() -> io::Result<()> {
                 let layout = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(12), // System stats
-                        // Constraint::Length(20),  // cpu info
-                        Constraint::Min(5),     // Process list
+                        Constraint::Percentage(25), // System stats
+                        Constraint::Percentage(50),  // cpu info
+                        Constraint::Percentage(25),     // Process list
                     ])
                     .split(frame.area());
 
@@ -496,10 +549,24 @@ fn main() -> io::Result<()> {
                 ])
                 .split(layout[0]);
 
+                let graphs_layout = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(vec![
+                    Constraint::Percentage(33),
+                    Constraint::Percentage(33),
+                    Constraint::Percentage(34),
+                ])
+                .split(layout[2]);
+
+                let background = Block::default()
+                .style(Style::default().bg(Color::Black));
+                frame.render_widget(background, frame.area());
+
                 frame.render_widget(system_info(&sys), upper_list_layout[0]);
                 frame.render_widget(usage_info(&sys), upper_list_layout[1]);
                 frame.render_widget(cpu_info(&sys), upper_list_layout[2]);
                 frame.render_widget(process_list(&sys, &mut state), layout[1]);
+                frame.render_widget(cpu_graph(&sys, &mut state), graphs_layout[0]);
             }
         })?;
 
