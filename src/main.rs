@@ -2,11 +2,7 @@ use sysinfo::{System, Pid};
 use std::io;
 use crossterm::event::{Event, KeyCode};
 use ratatui::{
-    layout::*,
-    widgets::*,
-    style::{Style, Modifier, Color},
-    text::{Span, Line},
-    symbols,
+    layout::*, style::{Color, Modifier, Style, Stylize}, symbols, text::{Line, Span}, widgets::*, Frame
 };
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid as NixPid;
@@ -431,29 +427,108 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
     .column_spacing(1)
 }
 
-fn cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState) ->Chart<'a>{
+fn calculate_graph_x_ticks(area_width: u16)-> usize {
+    let max_x_ticks = area_width;
+    max_x_ticks as usize
+}
+
+fn calculate_x_bounds(data: &Vec<(f64, f64)>, x_ticks: usize)-> (f64, f64) {
+    
+    let x_start = data
+        .get(data.len().saturating_sub(x_ticks))
+        .map(|(x, _x)|*x)
+        .unwrap_or(0.0);
+    let x_end = if data.len() > x_ticks
+        { data.last()
+        .map(|(x, _x)|*x)
+        .unwrap_or(x_ticks.saturating_sub(1) as f64)
+        }
+        else {x_ticks.saturating_sub(1) as f64};
+
+    (x_start, x_end)
+}
+
+//  IGNORE this part but keep ot for now
+
+// fn value_to_color(value: f64, max: f64) -> Color{
+    
+//     let ratio = value/max;
+    
+//     Color::Rgb(
+//         (255.0 * ratio) as u8,       // Red component increases
+//         (255.0 * (1.0 - ratio)) as u8, // Blue component decreases
+//         100                            // Green fixed at 0
+//     )
+// }
+
+// fn cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect) ->canvas::Canvas<'a, impl Fn(&mut canvas::Context) + 'a>{
+
+//     // preparing the new point
+//     let new_x = app.g1_data.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
+//     let new_y = sys.global_cpu_usage() as f64;
+//     app.g1_data.push((new_x, new_y));
+
+//     let width = area.width; let height = area.height;
+    
+//     let x_ticks = calculate_graph_x_ticks(width);
+
+//     let x_bounds = calculate_x_bounds(&app.g1_data, x_ticks);
+
+//     let x_bounds = [x_bounds.0, x_bounds.1];
+
+
+//     let data = &app.g1_data;
+
+
+//     canvas::Canvas::default()
+//     .block(Block::bordered().title("CPU usage").style(Style::default().bg(Color::Black)))
+//     .x_bounds(x_bounds)
+//     .y_bounds([0.0, 100.0])
+//     .marker(symbols::Marker::Braille)
+//     .paint(|ctx: &mut canvas::Context|
+//     {
+//         for (i, &(x, y)) in data.iter().enumerate(){
+//             let color = value_to_color(y, 100.0);
+
+//             for y_pos in 0..(y as usize) {
+//                 ctx.print(
+//                     i as f64 + 0.5,
+//                     y_pos as f64 + 0.5,
+//                     "⣿".fg(color)
+//                 );
+//             }
+//         }
+//     })
+// }
+
+fn cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect) ->Chart<'a>{
+    
     let new_x = app.g1_data.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
     let new_y = sys.global_cpu_usage() as f64;
 
     app.g1_data.push((new_x, new_y));
 
+    let width = area.width;
+    
+    let x_ticks = calculate_graph_x_ticks(width);
+
+    let x_bounds = calculate_x_bounds(&app.g1_data, x_ticks);
+
+    let x_bounds = [x_bounds.0, x_bounds.1];
+
+    if app.g1_data.len() > x_ticks{
+        app.g1_data.remove(0);
+    }
+
 
     let dataset = Dataset::default()
     .data(&app.g1_data)
     .graph_type(GraphType::Bar)
-    .marker(symbols::Marker::Braille);
-
-
-    let x_bounds = if app.g1_data.len() > 10 {
-        [app.g1_data[0].0, app.g1_data.last().unwrap().0]
-    } else {
-        [0.0, 10.0] // Default if < 2 points
-    };
-
+    .marker(symbols::Marker::Braille)
+    .style(Style::default().fg(Color::Rgb(120, 200, 120)).bg(Color::Black));
 
     // Configure axes
     let x_axis = Axis::default()
-        .title("Time")
         .bounds(x_bounds);
 
     let y_axis = Axis::default()
@@ -467,13 +542,86 @@ fn cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState) ->Chart<'a>{
         .y_axis(y_axis) 
         .block(
             Block::default()
-                .title(Span::styled(
-                    "Per CPU usage", 
-                    Style::default().add_modifier(Modifier::BOLD)
-                ))
                 .borders(Borders::ALL)
                 .style(Style::default().bg(Color::Black)))
 
+}
+
+fn draw_ui(sys: &sysinfo::System, state: & mut AppState, frame: &mut Frame){
+    // Different layout based on whether help is showing
+    if state.show_help {
+        // Layout with help panel
+        let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(12),  // System stats
+            // Constraint::Length(20),  // cpu info
+            Constraint::Length(20),  // Help panel 
+            Constraint::Min(5),      // Process list
+        ])
+        .split(frame.area());
+
+        let upper_list_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(vec![
+            Constraint::Percentage(36),
+            Constraint::Percentage(25),
+            Constraint::Percentage(39),
+        ])
+        .split(layout[0]);
+
+        let background = Block::default()
+        .style(Style::default().bg(Color::Black));
+        frame.render_widget(background, frame.area());
+
+        frame.render_widget(system_info(&sys), upper_list_layout[0]);
+        frame.render_widget(usage_info(&sys), upper_list_layout[1]);
+        frame.render_widget(cpu_info(&sys), upper_list_layout[2]);
+        frame.render_widget(help_panel(), layout[1]);
+        frame.render_widget(process_list(&sys, state), layout[2]);
+    } else {
+        // Standard layout without help
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(25), // System stats
+                Constraint::Percentage(50),  // cpu info
+                Constraint::Percentage(25),     // Process list
+            ])
+            .split(frame.area());
+
+        // let [top, middle, bottom] = Layout::vertical(
+        //     [Constraint::Fill(1), Constraint::Fill(2),
+        //                  Constraint::Fill(1)]).areas(frame.area());
+
+        let upper_list_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(vec![
+            Constraint::Percentage(36),
+            Constraint::Percentage(25),
+            Constraint::Percentage(39),
+        ])
+        .split(layout[0]);
+
+        let graphs_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(vec![
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+        ])
+        .split(layout[2]);
+
+        let background = Block::default()
+        .style(Style::default().bg(Color::Black));
+        frame.render_widget(background, frame.area());
+
+        frame.render_widget(system_info(&sys), upper_list_layout[0]);
+        frame.render_widget(usage_info(&sys), upper_list_layout[1]);
+        frame.render_widget(cpu_info(&sys), upper_list_layout[2]);
+        frame.render_widget(process_list(&sys, state), layout[1]);
+        frame.render_widget(cpu_graph(&sys, state, graphs_layout[0]), graphs_layout[0]);
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -497,78 +645,7 @@ fn main() -> io::Result<()> {
         
         let total_processes = sys.processes().len();
 
-        terminal.draw(|frame| {
-            // Different layout based on whether help is showing
-            if state.show_help {
-                // Layout with help panel
-                let layout = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(12),  // System stats
-                    // Constraint::Length(20),  // cpu info
-                    Constraint::Length(20),  // Help panel 
-                    Constraint::Min(5),      // Process list
-                ])
-                .split(frame.area());
-
-                let upper_list_layout = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(vec![
-                    Constraint::Percentage(36),
-                    Constraint::Percentage(25),
-                    Constraint::Percentage(39),
-                ])
-                .split(layout[0]);
-
-                let background = Block::default()
-                .style(Style::default().bg(Color::Black));
-                frame.render_widget(background, frame.area());
-
-                frame.render_widget(system_info(&sys), upper_list_layout[0]);
-                frame.render_widget(usage_info(&sys), upper_list_layout[1]);
-                frame.render_widget(cpu_info(&sys), upper_list_layout[2]);
-                frame.render_widget(help_panel(), layout[1]);
-                frame.render_widget(process_list(&sys, &mut state), layout[2]);
-            } else {
-                // Standard layout without help
-                let layout = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Percentage(25), // System stats
-                        Constraint::Percentage(50),  // cpu info
-                        Constraint::Percentage(25),     // Process list
-                    ])
-                    .split(frame.area());
-
-                let upper_list_layout = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(vec![
-                    Constraint::Percentage(36),
-                    Constraint::Percentage(25),
-                    Constraint::Percentage(39),
-                ])
-                .split(layout[0]);
-
-                let graphs_layout = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(vec![
-                    Constraint::Percentage(33),
-                    Constraint::Percentage(33),
-                    Constraint::Percentage(34),
-                ])
-                .split(layout[2]);
-
-                let background = Block::default()
-                .style(Style::default().bg(Color::Black));
-                frame.render_widget(background, frame.area());
-
-                frame.render_widget(system_info(&sys), upper_list_layout[0]);
-                frame.render_widget(usage_info(&sys), upper_list_layout[1]);
-                frame.render_widget(cpu_info(&sys), upper_list_layout[2]);
-                frame.render_widget(process_list(&sys, &mut state), layout[1]);
-                frame.render_widget(cpu_graph(&sys, &mut state), graphs_layout[0]);
-            }
-        })?;
+        terminal.draw(|frame| draw_ui(&sys, & mut state, frame))?;
 
         // Handle keyboard input for scrolling and process management
         if crossterm::event::poll(std::time::Duration::from_millis(750))? {
