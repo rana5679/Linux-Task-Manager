@@ -508,7 +508,7 @@ fn calculate_x_bounds(data: &Vec<(f64, f64)>, x_ticks: usize)-> (f64, f64) {
 //     })
 // }
 
-fn cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect) ->Chart<'a>{
+fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect) ->Chart<'a>{
     
     let new_x = app.g1_data.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
     let new_y = sys.global_cpu_usage() as f64;
@@ -953,53 +953,67 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame) {
         let process_section_height = (area.height as f32 * 0.5).floor() as u16;
         state.show_count = process_section_height.saturating_sub(3) as usize;
         
-        // Standard layout without help
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(25), // System stats (top section)
-                Constraint::Percentage(50), // Process list (middle section)
-                Constraint::Percentage(25), // Metrics section (bottom section)
-            ])
-            .split(frame.area());
+        // // Standard layout without help
+        // let layout = Layout::default()
+        //     .direction(Direction::Vertical)
+        //     .constraints([
+        //         Constraint::Percentage(25), // System stats (top section)
+        //         Constraint::Percentage(50), // Process list (middle section)
+        //         Constraint::Percentage(25), // Metrics section (bottom section)
+        //     ])
+        //     .split(frame.area());
 
-        let upper_list_layout = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(vec![
-                Constraint::Percentage(36),
-                Constraint::Percentage(25),
-                Constraint::Percentage(39),
-            ])
-            .split(layout[0]);
+        let [top, middle, bottom] = Layout::vertical(
+            [Constraint::Fill(1), Constraint::Fill(2),
+                         Constraint::Fill(2)]).areas(frame.area());
+
+        let [systeminfo, useageinfo] = Layout::horizontal(
+        [Constraint::Fill(1),
+                        Constraint::Fill(1)]).areas(top);
         
         // Create horizontal layout for CPU, memory, and disk sections - exactly like btop
-        let graphs_layout = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(vec![
-                Constraint::Percentage(33), // CPU graph
-                Constraint::Percentage(33), // Memory section
-                Constraint::Percentage(34), // Disk section
-            ])
-            .split(layout[2]);
+
+        let [cpu, network, mem_disk] = Layout::horizontal(
+            [Constraint::Fill(1), Constraint::Fill(1),
+                         Constraint::Fill(1)]).areas(middle);
+
+        let [cpus, cpu_graph] = Layout::vertical(
+            [Constraint::Fill(1),
+                         Constraint::Fill(1)]).areas(cpu);
+
+        let [mem, disk] = Layout::vertical(
+        [Constraint::Fill(1),
+                        Constraint::Fill(1)]).areas(mem_disk);
         
         // Background
         let background = Block::default()
             .style(Style::default().bg(Color::Black));
         frame.render_widget(background, frame.area());
 
-        // Top section widgets
-        frame.render_widget(system_info(&sys), upper_list_layout[0]);
-        frame.render_widget(usage_info(&sys), upper_list_layout[1]);
-        frame.render_widget(cpu_info(&sys), upper_list_layout[2]);
+
+        // Top section widgets - System info
+        frame.render_widget(system_info(&sys), systeminfo);
+        frame.render_widget(usage_info(&sys), useageinfo);
         
-        // Middle section - process list
-        frame.render_widget(process_list(&sys, state), layout[1]);
         
-        // Bottom section - three monitoring panels
-        frame.render_widget(cpu_graph(&sys, state, graphs_layout[0]), graphs_layout[0]);
-        frame.render_widget(memory_gauges(&sys), graphs_layout[1]);
-        frame.render_widget(disk_gauges(&sys), graphs_layout[2]);
+        // Middle section - Statistics
+
+        // CPU section
+        frame.render_widget(cpu_info(&sys), cpus);
+        frame.render_widget(get_cpu_graph(&sys, state, cpu_graph), cpu_graph);
+
+        // Network section
+        
+        
+        // Memory - Disk section
+        frame.render_widget(memory_gauges(&sys), mem);
+        frame.render_widget(disk_gauges(&sys), disk);
+
+        // Bottom Section - Process list
+        frame.render_widget(process_list(&sys, state), bottom);
     }
+
+
 }
 
 // Extension for colors to create darker/lighter variants
