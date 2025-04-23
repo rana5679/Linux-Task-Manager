@@ -1,1 +1,0 @@
-{closure@src/main.rs:649:5: 649:40}: ratatui::prelude::Widget
