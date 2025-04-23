@@ -2,9 +2,10 @@ use sysinfo::{System, Pid};
 use std::io;
 use crossterm::event::{Event, KeyCode};
 use ratatui::{
-    layout::*, style::{Color, Modifier, Style, Stylize}, symbols, text::{Line, Span}, widgets::*, Frame
+    layout::*, style::{Color, Modifier, Style}, symbols, text::{Line, Span}, widgets::*, Frame,
+    buffer::Buffer
 };
-use nix::sys::signal::{kill, Signal};
+use nix::sys::{self, signal::{kill, Signal}};
 use nix::unistd::Pid as NixPid;
 use libc::{getpriority, PRIO_PROCESS};
 
@@ -26,6 +27,9 @@ struct AppState {
     show_help: bool,        // Added for help panel toggle
     killed_pids: Vec<Pid>, // Track killed processes
     g1_data: Vec<(f64, f64)>, // track data points for graph 1
+    memory_data: Vec<(f64, f64)>,    // Memory usage over time
+    swap_data: Vec<(f64, f64)>,      // Swap usage over time
+    disk_data: Vec<(f64, f64)>,      // Disk usage over time
 }
 
 impl AppState {
@@ -40,6 +44,9 @@ impl AppState {
             show_help: false,
             killed_pids: Vec::new(), 
             g1_data: Vec::new(),
+            memory_data: Vec::new(),
+            swap_data: Vec::new(),
+            disk_data: Vec::new(),
         }
     }
 
@@ -494,7 +501,7 @@ fn calculate_x_bounds(data: &Vec<(f64, f64)>, x_ticks: usize)-> (f64, f64) {
 //                 ctx.print(
 //                     i as f64 + 0.5,
 //                     y_pos as f64 + 0.5,
-//                     "⣿".fg(color)
+//                     "â£¿".fg(color)
 //                 );
 //             }
 //         }
@@ -532,7 +539,6 @@ fn cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect) ->
         .bounds(x_bounds);
 
     let y_axis = Axis::default()
-        .title("CPU %")
         .bounds([0.0, 100.0]);
         //.labels(vec!["0".into(), "50".into(), "100".into()]);
 
@@ -543,35 +549,398 @@ fn cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect) ->
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .title("CPU %")
                 .style(Style::default().bg(Color::Black)))
 
 }
+struct MemoryGauges<'a> {
+    total_mem: f64,
+    used_mem: f64,
+    available_mem: f64,
+    cached_mem: f64,
+    free_mem: f64,
+    block: Block<'a>,
+}
+/// Returns (total, used, available, cached, free) in GiB, calculated exactly like btop
+fn get_btop_memory_stats() -> (f64, f64, f64, f64, f64) {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
 
-fn draw_ui(sys: &sysinfo::System, state: & mut AppState, frame: &mut Frame){
-    // Different layout based on whether help is showing
+    let mut memtotal = 0.0;
+    let mut memfree = 0.0;
+    let mut memavailable = 0.0;
+    let mut cached = 0.0;
+    let mut sreclaimable = 0.0;
+    let mut shmem = 0.0;
+
+    let file = File::open("/proc/meminfo").unwrap();
+    let reader = BufReader::new(file);
+
+    for line in reader.lines().flatten() {
+        if line.starts_with("MemTotal:") {
+            memtotal = line.split_whitespace().nth(1).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+        } else if line.starts_with("MemFree:") {
+            memfree = line.split_whitespace().nth(1).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+        } else if line.starts_with("MemAvailable:") {
+            memavailable = line.split_whitespace().nth(1).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+        } else if line.starts_with("Cached:") && !line.contains("SwapCached") {
+            cached = line.split_whitespace().nth(1).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+        } else if line.starts_with("SReclaimable:") {
+            sreclaimable = line.split_whitespace().nth(1).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+        } else if line.starts_with("Shmem:") {
+            shmem = line.split_whitespace().nth(1).unwrap_or("0").parse::<f64>().unwrap_or(0.0);
+        }
+    }
+
+    // btop's formulas:
+    let used = memtotal - memavailable;
+    let cached_btop = cached + sreclaimable - shmem;
+
+    // Convert from KiB to GiB (1 GiB = 1024^2 KiB)
+    let kb_to_gib = 1024.0 * 1024.0;
+    (
+        memtotal / kb_to_gib,         // total
+        used / kb_to_gib,             // used
+        memavailable / kb_to_gib,     // available
+        cached_btop / kb_to_gib,      // cached
+        memfree / kb_to_gib           // free
+    )
+}
+
+
+impl<'a> MemoryGauges<'a> {
+    fn new(sys: &sysinfo::System) -> Self {
+        let (total_mem, used_mem, available_mem, cached_mem, free_mem) = get_btop_memory_stats();
+        Self {
+            total_mem,
+            used_mem,
+            available_mem,
+            cached_mem,
+            free_mem,
+            block: Block::default()
+                .title("mem")
+                .borders(Borders::ALL)
+                .style(Style::default().bg(Color::Black)),
+        }
+    }
+}
+// btop-like colors
+const MEM_USED_COLOR: Color = Color::Rgb(220, 70, 70);       // Red
+const MEM_AVAILABLE_COLOR: Color = Color::Rgb(220, 220, 70);  // Yellow
+const MEM_CACHED_COLOR: Color = Color::Rgb(70, 70, 220);      // Blue
+const MEM_FREE_COLOR: Color = Color::Rgb(70, 220, 70);        // Green
+const DISK_IO_COLOR: Color = Color::Rgb(220, 200, 80);        // Yellow
+const DISK_USED_COLOR: Color = Color::Rgb(220, 70, 70);       // Red
+const DISK_FREE_COLOR: Color = Color::Rgb(70, 200, 70);       // Green
+
+impl<'a> Widget for MemoryGauges<'a> {
+    fn render(self, rect: Rect, buf: &mut Buffer) {
+        let used_percent = (self.used_mem / self.total_mem) * 100.0;
+        let available_percent = (self.available_mem / self.total_mem) * 100.0;
+        let cached_percent = (self.cached_mem / self.total_mem) * 100.0;
+        let free_percent = (self.free_mem / self.total_mem) * 100.0;
+
+        let inner = self.block.inner(rect);
+        self.block.render(rect, buf);
+
+        // Title with total memory at top
+        Paragraph::new(format!("Total: {:.1} GiB", self.total_mem))
+            .style(Style::default().fg(Color::White))
+            .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
+
+        // Each metric takes 2 lines
+        let memory_y = [
+            inner.y + 1,  // Used
+            inner.y + 4,  // Available
+            inner.y + 7,  // Cached
+            inner.y + 10,  // Free
+        ];
+        
+        render_memory_line(
+            Rect::new(inner.x, memory_y[0], inner.width, 2),
+            "Used:", 
+            used_percent, 
+            self.used_mem,
+            MEM_USED_COLOR,
+            buf,
+        );
+        render_memory_line(
+            Rect::new(inner.x, memory_y[1], inner.width, 2),
+            "Available:", 
+            available_percent, 
+            self.available_mem,
+            MEM_AVAILABLE_COLOR,
+            buf,
+        );
+        render_memory_line(
+            Rect::new(inner.x, memory_y[2], inner.width, 2),
+            "Cached:", 
+            cached_percent, 
+            self.cached_mem,
+            MEM_CACHED_COLOR,
+            buf,
+        );
+        render_memory_line(
+            Rect::new(inner.x, memory_y[3], inner.width, 2),
+            "Free:", 
+            free_percent, 
+            self.free_mem,
+            MEM_FREE_COLOR,
+            buf,
+        );
+    }
+}
+
+
+fn render_memory_line(area: Rect, label: &str, percent: f64, value: f64, color: Color, buf: &mut Buffer) {
+    // First line: label left, value right
+    Paragraph::new(format!("{:<9}{:>8.2} GiB", label, value))
+        .style(Style::default().fg(color))
+        .render(Rect::new(area.x, area.y, area.width, 1), buf);
+
+    // Second line: graph left, percent right
+    let bar_width = area.width.saturating_sub(6);
+    render_braille_gauge(
+        Rect::new(area.x, area.y + 1, bar_width, 1),
+        percent / 100.0,
+        color,
+        buf,
+    );
+    Paragraph::new(format!("{:>3.0}%", percent))
+        .style(Style::default().fg(color))
+        .alignment(Alignment::Right)
+        .render(Rect::new(area.x + bar_width, area.y + 1, 6, 1), buf);
+}
+
+
+fn memory_gauges<'a>(sys: &sysinfo::System) -> MemoryGauges {
+    MemoryGauges::new(sys)
+}
+struct DiskGauges<'a> {
+    sys: &'a sysinfo::System,
+    block: Block<'a>,
+}
+
+
+impl<'a> DiskGauges<'a> {
+    fn new(sys: &'a sysinfo::System) -> Self {
+        Self {
+            sys,
+            block: Block::default()
+                .title("disks")
+                // .border_style(Color::Rgb((20), (30), (40)))
+                .borders(Borders::ALL)
+                .style(Style::default().bg(Color::Black)),
+        }
+    }
+}
+fn render_braille_gauge(area: Rect, ratio: f64, color: Color, buf: &mut Buffer) {
+    // Ensure we're within buffer bounds
+    let area = area.intersection(*buf.area());
+    if area.area() == 0 {
+        return;
+    }
+    
+    let width = area.width as usize;
+    
+    // These characters create a dotted pattern with increasing density
+    let braille_chars = [
+        '⠀', '⠁', '⠉', '⠋', '⠛', '⠟', '⠿', '⣿'
+    ];
+    
+    // Calculate how many dots will be filled
+    let filled_width = (ratio * width as f64) as usize;
+    
+    // Calculate partial fill for the last character
+    let partial_char_idx = ((ratio * width as f64 * 8.0) as usize) % 8;
+    
+    // Render each dot position
+    for x in 0..width {
+        let pos = area.x + x as u16;
+        if x < filled_width {
+            // Use the modern buffer indexing syntax
+            buf[(pos, area.y)].set_char('⣿').set_fg(color);
+        } else if x == filled_width && partial_char_idx > 0 {
+            buf[(pos, area.y)].set_char(braille_chars[partial_char_idx]).set_fg(color);
+        } else {
+            buf[(pos, area.y)].set_char('⠀').set_fg(color.darker(50));
+        }
+    }
+}
+
+fn render_disk_line(
+    area: Rect,
+    label: &str,
+    percent: f64,
+    value: f64,
+    color: Color,
+    buf: &mut Buffer,
+) {
+    // First line: label left, value right
+    Paragraph::new(format!("{:<8}{:>8.2} GiB", label, value))
+        .style(Style::default().fg(color))
+        .render(Rect::new(area.x, area.y, area.width, 1), buf);
+
+    // Second line: bar and percent
+    let bar_width = area.width.saturating_sub(6);
+    render_braille_gauge(
+        Rect::new(area.x, area.y + 1, bar_width, 1),
+        percent / 100.0,
+        color,
+        buf,
+    );
+    Paragraph::new(format!("{:>3.0}%", percent))
+        .style(Style::default().fg(color))
+        .alignment(Alignment::Right)
+        .render(Rect::new(area.x + bar_width, area.y + 1, 6, 1), buf);
+}
+
+impl<'a> Widget for DiskGauges<'a> {
+    fn render(self, rect: Rect, buf: &mut Buffer) {
+        let inner = self.block.inner(rect);
+        self.block.render(rect, buf);
+        
+        // Spacing constants for each disk entry
+        const DISK_ENTRY_HEIGHT: u16 = 4; // Title + IO% + Used + Free
+        
+        // Calculate how many disks we show
+        let disks = sysinfo::Disks::new_with_refreshed_list();
+        let mut y_offset = inner.y;
+        
+        // First render root disk (if exists)
+        if let Some(disk) = disks.iter().find(|d| d.mount_point().to_string_lossy() == "/") {
+            let total = disk.total_space() as f64 / 1_073_741_824.0; // GiB
+            let free = disk.available_space() as f64 / 1_073_741_824.0;
+            let used = total - free;
+            let used_percent = (used / total) * 100.0;
+            let free_percent = 100.0 - used_percent;
+            
+            // Title line with total size
+            Paragraph::new(format!("root {:.0} GiB", total))
+                .style(Style::default().fg(Color::White))
+                .render(Rect::new(inner.x, y_offset + 1, inner.width, 1), buf);;
+            
+            // Used line
+            Paragraph::new(format!("Used: {:.0}%", used_percent))
+            .style(Style::default().fg(MEM_USED_COLOR))
+            .render(Rect::new(inner.x, y_offset + 2, 10, 1), buf);
+            
+            render_braille_gauge(
+                Rect::new(inner.x + 10, y_offset + 2, inner.width.saturating_sub(20), 1),
+                used_percent / 100.0,
+                MEM_USED_COLOR,
+                buf
+            );
+            
+            Paragraph::new(format!("{:.1} GiB", used))
+                .style(Style::default().fg(Color::Gray))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x + inner.width.saturating_sub(10), y_offset + 2, 10, 1), buf);
+            
+            // Free line
+            Paragraph::new(format!("Free: {:.0}%", free_percent))
+                .style(Style::default().fg(Color::Green))
+                .render(Rect::new(inner.x, y_offset + 3, 10, 1), buf);
+            
+            render_braille_gauge(
+                Rect::new(inner.x + 10, y_offset + 3, inner.width.saturating_sub(20), 1),
+                free_percent / 100.0,
+                Color::Green,
+                buf
+            );
+            
+            Paragraph::new(format!("{:.1} GiB", free))
+                .style(Style::default().fg(Color::Gray))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x + inner.width.saturating_sub(10), y_offset + 3, 10, 1), buf);
+            
+            y_offset += DISK_ENTRY_HEIGHT + 1; // Add spacing between entries
+        }
+        
+        // Then render swap if it exists
+        if self.sys.total_swap() > 0 {
+            let total_swap = self.sys.total_swap() as f64 / 1_073_741_824.0; // GiB
+            let used_swap = self.sys.used_swap() as f64 / 1_073_741_824.0;
+            let used_percent = if total_swap > 0.0 { (used_swap / total_swap) * 100.0 } else { 0.0 };
+            let free_percent = 100.0 - used_percent;
+            
+            // Title line
+            Paragraph::new(format!("swap {:.2} GiB", total_swap))
+                .style(Style::default().fg(Color::White))
+                .render(Rect::new(inner.x, y_offset, inner.width, 1), buf);
+            
+            // Used line
+            Paragraph::new(format!("Used: {:.0}%", used_percent))
+                .style(Style::default().fg(Color::Red))
+                .render(Rect::new(inner.x, y_offset + 1, 10, 1), buf);
+            
+            render_braille_gauge(
+                Rect::new(inner.x + 10, y_offset + 1, inner.width.saturating_sub(20), 1),
+                used_percent / 100.0,
+                Color::Red,
+                buf
+            );
+            
+            Paragraph::new(format!("{:.1} GiB", used_swap))
+                .style(Style::default().fg(Color::Gray))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x + inner.width.saturating_sub(10), y_offset + 1, 10, 1), buf);
+            
+            // Free line
+            Paragraph::new(format!("Free: {:.0}%", free_percent))
+                .style(Style::default().fg(Color::Green))
+                .render(Rect::new(inner.x, y_offset + 2, 10, 1), buf);
+            
+            render_braille_gauge(
+                Rect::new(inner.x + 10, y_offset + 2, inner.width.saturating_sub(20), 1),
+                free_percent / 100.0,
+                Color::Green,
+                buf
+            );
+            
+            Paragraph::new(format!("{:.1} GiB", total_swap - used_swap))
+                .style(Style::default().fg(Color::Gray))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x + inner.width.saturating_sub(10), y_offset + 2, 10, 1), buf);
+        }
+    }
+}
+
+fn disk_gauges(sys: &sysinfo::System) -> DiskGauges {
+    DiskGauges::new(sys)
+}
+
+fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame) {
+    // Get dynamic terminal size
+    let area = frame.area();
+    
+    // Calculate dynamic process count based on terminal height
     if state.show_help {
+        // For help layout: calculate available space after system stats and help panel
+        let available_height = area.height.saturating_sub(12 + 20 + 3);
+        state.show_count = available_height as usize;
+        
         // Layout with help panel
         let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(12),  // System stats
-            // Constraint::Length(20),  // cpu info
-            Constraint::Length(20),  // Help panel 
-            Constraint::Min(5),      // Process list
-        ])
-        .split(frame.area());
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(12),  // System stats
+                Constraint::Length(20),  // Help panel 
+                Constraint::Min(5),      // Process list
+            ])
+            .split(frame.area());
 
         let upper_list_layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(vec![
-            Constraint::Percentage(36),
-            Constraint::Percentage(25),
-            Constraint::Percentage(39),
-        ])
-        .split(layout[0]);
+            .direction(Direction::Horizontal)
+            .constraints(vec![
+                Constraint::Percentage(36),
+                Constraint::Percentage(25),
+                Constraint::Percentage(39),
+            ])
+            .split(layout[0]);
 
         let background = Block::default()
-        .style(Style::default().bg(Color::Black));
+            .style(Style::default().bg(Color::Black));
         frame.render_widget(background, frame.area());
 
         frame.render_widget(system_info(&sys), upper_list_layout[0]);
@@ -580,49 +949,93 @@ fn draw_ui(sys: &sysinfo::System, state: & mut AppState, frame: &mut Frame){
         frame.render_widget(help_panel(), layout[1]);
         frame.render_widget(process_list(&sys, state), layout[2]);
     } else {
+        // For standard layout: calculate available process space
+        let process_section_height = (area.height as f32 * 0.5).floor() as u16;
+        state.show_count = process_section_height.saturating_sub(3) as usize;
+        
         // Standard layout without help
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(25), // System stats
-                Constraint::Percentage(50),  // cpu info
-                Constraint::Percentage(25),     // Process list
+                Constraint::Percentage(25), // System stats (top section)
+                Constraint::Percentage(50), // Process list (middle section)
+                Constraint::Percentage(25), // Metrics section (bottom section)
             ])
             .split(frame.area());
 
-        // let [top, middle, bottom] = Layout::vertical(
-        //     [Constraint::Fill(1), Constraint::Fill(2),
-        //                  Constraint::Fill(1)]).areas(frame.area());
-
         let upper_list_layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(vec![
-            Constraint::Percentage(36),
-            Constraint::Percentage(25),
-            Constraint::Percentage(39),
-        ])
-        .split(layout[0]);
-
+            .direction(Direction::Horizontal)
+            .constraints(vec![
+                Constraint::Percentage(36),
+                Constraint::Percentage(25),
+                Constraint::Percentage(39),
+            ])
+            .split(layout[0]);
+        
+        // Create horizontal layout for CPU, memory, and disk sections - exactly like btop
         let graphs_layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(vec![
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-        ])
-        .split(layout[2]);
-
+            .direction(Direction::Horizontal)
+            .constraints(vec![
+                Constraint::Percentage(33), // CPU graph
+                Constraint::Percentage(33), // Memory section
+                Constraint::Percentage(34), // Disk section
+            ])
+            .split(layout[2]);
+        
+        // Background
         let background = Block::default()
-        .style(Style::default().bg(Color::Black));
+            .style(Style::default().bg(Color::Black));
         frame.render_widget(background, frame.area());
 
+        // Top section widgets
         frame.render_widget(system_info(&sys), upper_list_layout[0]);
         frame.render_widget(usage_info(&sys), upper_list_layout[1]);
         frame.render_widget(cpu_info(&sys), upper_list_layout[2]);
+        
+        // Middle section - process list
         frame.render_widget(process_list(&sys, state), layout[1]);
+        
+        // Bottom section - three monitoring panels
         frame.render_widget(cpu_graph(&sys, state, graphs_layout[0]), graphs_layout[0]);
+        frame.render_widget(memory_gauges(&sys), graphs_layout[1]);
+        frame.render_widget(disk_gauges(&sys), graphs_layout[2]);
     }
 }
+
+// Extension for colors to create darker/lighter variants
+trait ColorExt {
+    fn darker(&self, amount: u8) -> Self;
+    fn lighter(&self, amount: u8) -> Self;
+}
+
+impl ColorExt for Color {
+    fn darker(&self, amount: u8) -> Self {
+        match self {
+            Color::Rgb(r, g, b) => {
+                Color::Rgb(
+                    r.saturating_sub(amount),
+                    g.saturating_sub(amount),
+                    b.saturating_sub(amount),
+                )
+            }
+            _ => *self,
+        }
+    }
+    
+    fn lighter(&self, amount: u8) -> Self {
+        match self {
+            Color::Rgb(r, g, b) => {
+                Color::Rgb(
+                    r.saturating_add(amount),
+                    g.saturating_add(amount),
+                    b.saturating_add(amount),
+                )
+            }
+            _ => *self,
+        }
+    }
+}
+
 
 fn main() -> io::Result<()> {
     // Initialize terminal
