@@ -1,0 +1,15 @@
+/home/arwam/Linux-Task-Manager/target/debug/deps/libeyre-e3f1eaf8b154700b.rmeta: /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/lib.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/backtrace.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/chain.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/context.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/error.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/fmt.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/kind.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/macros.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/option.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/ptr.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/wrapper.rs
+
+/home/arwam/Linux-Task-Manager/target/debug/deps/eyre-e3f1eaf8b154700b.d: /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/lib.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/backtrace.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/chain.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/context.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/error.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/fmt.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/kind.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/macros.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/option.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/ptr.rs /home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/wrapper.rs
+
+/home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/lib.rs:
+/home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/backtrace.rs:
+/home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/chain.rs:
+/home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/context.rs:
+/home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/error.rs:
+/home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/fmt.rs:
+/home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/kind.rs:
+/home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/macros.rs:
+/home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/option.rs:
+/home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/ptr.rs:
+/home/arwam/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/eyre-0.6.12/src/wrapper.rs:

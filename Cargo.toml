@@ -4,13 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sysinfo = "0.34.2"
 crossterm = "0.28.1"
 ratatui = "0.29.0"
 color-eyre = "0.6.3"
 cli-table = "0.5"
 nix = { version = "0.27.1", features = ["signal", "process"] }  # Add feature flags
 libc = "0.2.171"
+sysinfo = { version = "0.34.2", features = ["disk"] }  # Add disk feature
+rand = "0.8.5"
+
+
 
 [[bin]]
 name = "linux-task-manager"

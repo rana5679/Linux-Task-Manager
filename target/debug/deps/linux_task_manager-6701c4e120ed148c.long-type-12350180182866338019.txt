@@ -1,0 +1,1 @@
+{closure@src/main.rs:720:5: 720:40}: ratatui::prelude::Widget
