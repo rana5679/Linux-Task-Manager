@@ -1,13 +1,159 @@
+use std::cell::RefCell;
+use std::io::{stdout};
+use std::rc::Rc;
 use sysinfo::{System, Pid};
 use std::io;
-use crossterm::event::{Event, KeyCode};
-use ratatui::{
-    layout::*, style::{Color, Modifier, Style}, symbols, text::{Line, Span}, widgets::*, Frame,
-    buffer::Buffer
+use crossterm::{
+    event::{self, Event, KeyCode,DisableMouseCapture,EnableMouseCapture},
+    execute,
+    terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
+use ratatui::{
+    layout::*, style::{Color, Modifier, Style}, symbols, text::{Line, Span,Text}, widgets::*, Frame,
+    buffer::Buffer, backend::CrosstermBackend,   widgets::{Block, Borders, Paragraph},
+    Terminal,
+};
+
 use nix::sys::{self, signal::{kill, Signal}};
 use nix::unistd::Pid as NixPid;
 use libc::{getpriority, PRIO_PROCESS};
+
+#[derive(Eq, PartialEq)]
+// struct representing each process and its information
+struct TreeProc {
+    pid: u32,
+    ppid: u32,
+    displayed: bool,
+    children: Vec<Rc<RefCell<TreeProc>>>,
+}
+
+impl TreeProc {
+    fn new(pid: u32, ppid: u32) -> Rc<RefCell<Self>> {
+        Rc::new(RefCell::new(TreeProc {
+            pid,
+            ppid,
+            displayed: false,
+            children: Vec::new(),
+        }))
+    }
+
+    // adds a child to the children 
+    fn addchild(&mut self, child: Rc<RefCell<Self>>) {
+        self.children.push(child);
+    }
+
+    // getter for the process id
+    fn get_pid(&self) -> u32 {
+        self.pid
+    }
+
+    // getter for the parent process id
+    fn get_ppid(&self) -> u32 {
+        self.ppid
+    }
+
+    // getter for the children vector for a process
+    fn get_children(&self) -> Vec<Rc<RefCell<TreeProc>>> {
+        self.children.clone()
+    }
+
+    // gets the number of children for a process
+    fn get_numchildren(&self) -> usize {
+        self.children.len()
+    }
+}
+
+// creates a vector of Treeprocs and fills the in the information about each process
+fn Tree_create() -> Vec<Rc<RefCell<TreeProc>>> {
+    let mut system = System::new_all();
+    system.refresh_all();
+
+    // vector for all the processes in the system 
+    let mut processes_running: Vec<Rc<RefCell<TreeProc>>> = Vec::new();
+
+    // fills the pid and ppid for each process
+    for (pid, process) in system.processes() {
+        let parent_pid = process.parent().unwrap_or(0.into());
+        let curr_proc = TreeProc::new(pid.as_u32(), parent_pid.as_u32());
+        processes_running.push(curr_proc);
+    }
+
+    // creates a reference to each child of a process and adds them all to the children vector for each process
+    for proc in &processes_running {
+        for proc_child in &processes_running {
+            if proc.borrow().get_pid() == proc_child.borrow().get_ppid() {
+                proc.borrow_mut().addchild(Rc::clone(proc_child));
+            }
+        }
+    }
+
+    processes_running
+}
+
+// find the root process which is the parents of all parents
+fn find_root(process_arr: &Vec<Rc<RefCell<TreeProc>>>) -> Option<usize> {
+    for (index, proc) in process_arr.iter().enumerate() {
+        // this process would have the parent id 0 so we look for it in the vector of processes
+        if proc.borrow().get_ppid() == 0 {
+            return Some(index);
+        }
+    }
+    None
+}
+
+// creates the tree display of processes 
+fn Tree_display(
+    process_arr: Vec<Rc<RefCell<TreeProc>>>,  // Take ownership of the vector
+    indent: usize,
+    current: u32,
+) -> Text<'static> {
+    let mut tree_levels = Vec::new();
+
+    // creates a line for each process
+    for proc in process_arr {  
+        let curr_proc = proc.borrow();
+        let prefix = "   ".repeat(indent);
+
+        // checks which process line is selected and highlights it
+        let line = if current == curr_proc.get_pid() {
+            Line::from(vec![
+                Span::raw(prefix.clone()),
+                Span::styled(
+                    format!("{}", curr_proc.get_pid()),
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])
+        } 
+        // if not selected then it does not get highlighted
+        else {
+            Line::from(vec![Span::raw(format!("{} -->  {}", prefix, curr_proc.get_pid()))])
+        };
+
+        tree_levels.push(line);
+
+        
+        let children = curr_proc.get_children();
+        // recursively calls the function to display all the processes
+        let children_text = Tree_display(children, indent + 1, current);
+        tree_levels.extend(children_text.lines);
+    }
+
+    Text::from(tree_levels)
+}
+
+// does depth first search on each process and returns a vector of that order
+fn stack_proc(procs: &mut Vec<Rc<RefCell<TreeProc>>>, parent: &Rc<RefCell<TreeProc>> ) {
+    let proc = parent.borrow();
+    for child in &proc.get_children() {
+        procs.push(Rc::clone(&child));
+        stack_proc(procs,child)
+    }
+}
+
 
 /// Enum to define sorting modes for the process list
 enum SortMode {
@@ -30,10 +176,18 @@ struct AppState {
     memory_data: Vec<(f64, f64)>,    // Memory usage over time
     swap_data: Vec<(f64, f64)>,      // Swap usage over time
     disk_data: Vec<(f64, f64)>,      // Disk usage over time
+    proc_tree: Vec<Rc<RefCell<TreeProc>>>, // contains the vector of processes with their children
+    root_proc: Rc<RefCell<TreeProc>>, // gets the root process and its children
+    curr_sel: u32, // gets the pid of the selected process
 }
 
 impl AppState {
-    fn new(show_count: usize) -> Self {
+  fn new(
+        show_count: usize,
+        proc_tree: Vec<Rc<RefCell<TreeProc>>>,
+        root_proc: Rc<RefCell<TreeProc>>,
+        curr_sel: u32,
+    ) -> Self {
         Self {
             scroll_position: 0,
             show_count,
@@ -42,11 +196,14 @@ impl AppState {
             cached_pids: None,
             selected_index: 0,
             show_help: false,
-            killed_pids: Vec::new(), 
+            killed_pids: Vec::new(),
             g1_data: Vec::new(),
             memory_data: Vec::new(),
             swap_data: Vec::new(),
             disk_data: Vec::new(),
+            proc_tree,
+            root_proc,
+            curr_sel,
         }
     }
 
@@ -910,17 +1067,31 @@ fn disk_gauges(sys: &sysinfo::System) -> DiskGauges {
     DiskGauges::new(sys)
 }
 
-fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame) {
+fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree: bool) {
     // Get dynamic terminal size
     let area = frame.area();
-    
-    // Calculate dynamic process count based on terminal height
+
+    // Background
+    let background = Block::default()
+        .style(Style::default().bg(Color::Black));
+    frame.render_widget(background, area);
+
+    // 🧠 If tree mode is enabled, draw tree and return early
+    if tree {
+        let tree_proc = vec![Rc::clone(&state.root_proc)];
+        let tree_text = Tree_display(tree_proc, 0, state.curr_sel);
+        let tree_widget = Paragraph::new(tree_text)
+            .block(Block::default().title("Process Tree").borders(Borders::ALL))
+            .style(Style::default().bg(Color::Black));
+        frame.render_widget(tree_widget, area);
+        return;
+    }
+
     if state.show_help {
         // For help layout: calculate available space after system stats and help panel
         let available_height = area.height.saturating_sub(12 + 20 + 3);
         state.show_count = available_height as usize;
-        
-        // Layout with help panel
+
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -928,7 +1099,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame) {
                 Constraint::Length(20),  // Help panel 
                 Constraint::Min(5),      // Process list
             ])
-            .split(frame.area());
+            .split(area);
 
         let upper_list_layout = Layout::default()
             .direction(Direction::Horizontal)
@@ -939,81 +1110,50 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame) {
             ])
             .split(layout[0]);
 
-        let background = Block::default()
-            .style(Style::default().bg(Color::Black));
-        frame.render_widget(background, frame.area());
-
         frame.render_widget(system_info(&sys), upper_list_layout[0]);
         frame.render_widget(usage_info(&sys), upper_list_layout[1]);
         frame.render_widget(cpu_info(&sys), upper_list_layout[2]);
         frame.render_widget(help_panel(), layout[1]);
         frame.render_widget(process_list(&sys, state), layout[2]);
     } else {
-        // For standard layout: calculate available process space
         let process_section_height = (area.height as f32 * 0.5).floor() as u16;
         state.show_count = process_section_height.saturating_sub(3) as usize;
-        
-        // // Standard layout without help
-        // let layout = Layout::default()
-        //     .direction(Direction::Vertical)
-        //     .constraints([
-        //         Constraint::Percentage(25), // System stats (top section)
-        //         Constraint::Percentage(50), // Process list (middle section)
-        //         Constraint::Percentage(25), // Metrics section (bottom section)
-        //     ])
-        //     .split(frame.area());
 
-        let [top, middle, bottom] = Layout::vertical(
-            [Constraint::Fill(1), Constraint::Fill(2),
-                         Constraint::Fill(2)]).areas(frame.area());
+        let [top, middle, bottom] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Fill(2),
+            Constraint::Fill(2)
+        ]).areas(area);
 
-        let [systeminfo, useageinfo] = Layout::horizontal(
-        [Constraint::Fill(1),
-                        Constraint::Fill(1)]).areas(top);
-        
-        // Create horizontal layout for CPU, memory, and disk sections - exactly like btop
+        let [systeminfo, useageinfo] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Fill(1)
+        ]).areas(top);
 
-        let [cpu, network, mem_disk] = Layout::horizontal(
-            [Constraint::Fill(1), Constraint::Fill(1),
-                         Constraint::Fill(1)]).areas(middle);
+        let [cpu, network, mem_disk] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Fill(1)
+        ]).areas(middle);
 
-        let [cpus, cpu_graph] = Layout::vertical(
-            [Constraint::Fill(1),
-                         Constraint::Fill(1)]).areas(cpu);
+        let [cpus, cpu_graph] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Fill(1)
+        ]).areas(cpu);
 
-        let [mem, disk] = Layout::vertical(
-        [Constraint::Fill(1),
-                        Constraint::Fill(1)]).areas(mem_disk);
-        
-        // Background
-        let background = Block::default()
-            .style(Style::default().bg(Color::Black));
-        frame.render_widget(background, frame.area());
+        let [mem, disk] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Fill(1)
+        ]).areas(mem_disk);
 
-
-        // Top section widgets - System info
         frame.render_widget(system_info(&sys), systeminfo);
         frame.render_widget(usage_info(&sys), useageinfo);
-        
-        
-        // Middle section - Statistics
-
-        // CPU section
         frame.render_widget(cpu_info(&sys), cpus);
         frame.render_widget(get_cpu_graph(&sys, state, cpu_graph), cpu_graph);
-
-        // Network section
-        
-        
-        // Memory - Disk section
         frame.render_widget(memory_gauges(&sys), mem);
         frame.render_widget(disk_gauges(&sys), disk);
-
-        // Bottom Section - Process list
         frame.render_widget(process_list(&sys, state), bottom);
     }
-
-
 }
 
 // Extension for colors to create darker/lighter variants
@@ -1057,7 +1197,17 @@ fn main() -> io::Result<()> {
 
     let mut sys = System::new_all();
     
-    let mut state = AppState::new(15);
+    
+   let processes_tree: Vec<Rc<RefCell<TreeProc>>> = Tree_create();
+   let root_index = find_root(&processes_tree).unwrap();
+   let root_proc = Rc::clone(&processes_tree[root_index]); 
+
+let mut state = AppState::new(15, processes_tree, Rc::clone(&root_proc), root_proc.borrow().get_pid());
+    
+    let mut tree:bool = false;
+    let mut i = 0; // index into the  tree stack
+    let mut stack: Vec<Rc<RefCell<TreeProc>>> = vec![Rc::clone(&state.root_proc)];
+    
     
     // Give system time to collect baseline metrics
     sys.refresh_all();
@@ -1072,7 +1222,7 @@ fn main() -> io::Result<()> {
         
         let total_processes = sys.processes().len();
 
-        terminal.draw(|frame| draw_ui(&sys, & mut state, frame))?;
+        terminal.draw(|frame| draw_ui(&sys, & mut state, frame,tree))?;
 
         // Handle keyboard input for scrolling and process management
         if crossterm::event::poll(std::time::Duration::from_millis(750))? {
@@ -1086,8 +1236,34 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('p') => state.change_sort_mode(SortMode::Pid),
                     
                     // Selection navigation
-                    KeyCode::Down => state.select_next(total_processes),
-                    KeyCode::Up => state.select_previous(),
+                    KeyCode::Down => {
+                        if tree{
+                            if i + 1 >= stack.len() {
+                                i = 0;
+                            }
+                        else{
+                            i = i + 1;
+                            }
+                        state.curr_sel = stack[i].borrow().get_pid();
+                        }
+                        else{
+                            state.select_next(total_processes)
+                        }
+                    },
+                    KeyCode::Up => {
+                        if tree{
+                            if i == 0 {
+                                i = stack.len() - 1 ; 
+                                }
+                            else if i != 0{
+                                i = i - 1;
+                                }
+                            state.curr_sel = stack[i].borrow().get_pid();
+                        }
+                        else{
+                            state.select_previous()
+                        }
+                    },
                     KeyCode::PageDown => state.page_down(total_processes),
                     KeyCode::PageUp => state.page_up(),
                     
@@ -1113,7 +1289,11 @@ fn main() -> io::Result<()> {
                             eprintln!("Error sending SIGCONT: {}", e);
                         }
                     },
-
+                    
+                    KeyCode::Char('t') => {
+                        tree = !tree;
+                        stack_proc(&mut stack, &state.root_proc.clone());
+                    },
                     _ => {}
                 }
                 
@@ -1124,3 +1304,5 @@ fn main() -> io::Result<()> {
     ratatui::restore();
     Ok(())
 }
+
+           
