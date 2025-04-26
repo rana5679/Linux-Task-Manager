@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::io::{stdout};
 use std::rc::Rc;
-use sysinfo::{System, Pid};
+use sysinfo::{System, Pid, Networks};
 use std::io;
 use crossterm::{
     event::{self, Event, KeyCode,DisableMouseCapture,EnableMouseCapture},
@@ -172,6 +172,10 @@ struct AppState {
     selected_index: usize,  // Added for process selection
     show_help: bool,        // Added for help panel toggle
     killed_pids: Vec<Pid>, // Track killed processes
+    total_download: u64,
+    total_upload: u64,
+    speed_download: u64,
+    speed_upload: u64,
     g1_data: Vec<(f64, f64)>, // track data points for graph 1
     memory_data: Vec<(f64, f64)>,    // Memory usage over time
     swap_data: Vec<(f64, f64)>,      // Swap usage over time
@@ -197,6 +201,10 @@ impl AppState {
             selected_index: 0,
             show_help: false,
             killed_pids: Vec::new(),
+            total_download: 0,
+            total_upload: 0,
+            speed_download: 0,
+            speed_upload: 0,
             g1_data: Vec::new(),
             memory_data: Vec::new(),
             swap_data: Vec::new(),
@@ -710,6 +718,82 @@ fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect
                 .style(Style::default().bg(Color::Black)))
 
 }
+
+// Helper to format bytes as human-readable string -- recheck this
+fn format_bytes(bytes: u64) -> String {
+    if bytes > 1 << 30 {
+        format!("{:.2} GB", bytes as f64 / (1 << 30) as f64)
+    } else if bytes > 1 << 20 {
+        format!("{:.2} MB", bytes as f64 / (1 << 20) as f64)
+    } else if bytes > 1 << 10 {
+        format!("{:.2} KB", bytes as f64 / (1 << 10) as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn format_speed(bytes_per_sec: u64) -> String {
+    if bytes_per_sec > 1 << 20 {
+        format!("{:.2} MB/s", bytes_per_sec as f64 / (1 << 20) as f64)
+    } else if bytes_per_sec > 1 << 10 {
+        format!("{:.2} KB/s", bytes_per_sec as f64 / (1 << 10) as f64)
+    } else {
+        format!("{} B/s", bytes_per_sec)
+    }
+}
+
+fn get_network_data<'a>(network:&'a Networks, app: &'a mut AppState, refresh_secs: f64) ->Table<'a>{
+
+    app.total_download = 0;
+    app.total_upload = 0;
+    app.speed_download = 0;
+    app.speed_upload = 0;
+    for (_iface, data) in network{
+        app.total_download += data.total_received(); // better to do this to get overall total since system started and in case we happen to miss a refresh
+        app.total_upload += data.total_transmitted();
+        app.speed_download += data.received();
+        app.speed_upload += data.transmitted();
+    }
+
+    // refresh rate is every 750 ms -- should I make this dynamic?
+    app.speed_download = (app.speed_download as f64 /refresh_secs) as u64;
+    app.speed_upload = (app.speed_upload as f64 /refresh_secs) as u64;
+
+    // next is to format this info as a table
+    let rows = vec![
+        Row::new(vec![
+            Cell::from(Span::styled("Upload", Style::default().fg(Color::Red))),
+            Cell::from("Total"),
+            Cell::from(format_bytes(app.total_upload)),
+            Cell::from(Span::styled("Download", Style::default().fg(Color::Blue))),
+            Cell::from("Total"),
+            Cell::from(format_bytes(app.total_download)),
+            
+        ]),
+        Row::new(vec![
+            Cell::from(""),
+            Cell::from("Speed"),
+            Cell::from(format_speed(app.speed_upload)),
+            Cell::from(""),
+            Cell::from("Speed"),
+            Cell::from(format_speed(app.speed_download)),
+        ]),
+
+    ];
+
+    Table::new(rows,
+        &[ratatui::layout::Constraint::Percentage(15), 
+        ratatui::layout::Constraint::Percentage(10),
+        ratatui::layout::Constraint::Percentage(20),
+        ratatui::layout::Constraint::Percentage(15),
+        ratatui::layout::Constraint::Percentage(10),
+        ratatui::layout::Constraint::Percentage(20)])
+    .block(Block::default().borders(Borders::ALL).title("Network Stats"))
+    .column_spacing(0)
+
+}
+
+
 struct MemoryGauges<'a> {
     total_mem: f64,
     used_mem: f64,
@@ -1067,7 +1151,7 @@ fn disk_gauges(sys: &sysinfo::System) -> DiskGauges {
     DiskGauges::new(sys)
 }
 
-fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree: bool) {
+fn draw_ui(sys: &sysinfo::System, networks: &sysinfo::Networks ,state: &mut AppState, frame: &mut Frame, tree: bool) {
     // Get dynamic terminal size
     let area = frame.area();
 
@@ -1076,7 +1160,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         .style(Style::default().bg(Color::Black));
     frame.render_widget(background, area);
 
-    // 🧠 If tree mode is enabled, draw tree and return early
+    // If tree mode is enabled, draw tree and return early
     if tree {
         let tree_proc = vec![Rc::clone(&state.root_proc)];
         let tree_text = Tree_display(tree_proc, 0, state.curr_sel);
@@ -1136,6 +1220,12 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
             Constraint::Fill(1)
         ]).areas(middle);
 
+        let [network_data, upload_graph, download_graph] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Fill(2),
+            Constraint::Fill(2)
+        ]).areas(network);
+
         let [cpus, cpu_graph] = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Fill(1)
@@ -1150,6 +1240,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         frame.render_widget(usage_info(&sys), useageinfo);
         frame.render_widget(cpu_info(&sys), cpus);
         frame.render_widget(get_cpu_graph(&sys, state, cpu_graph), cpu_graph);
+        frame.render_widget(get_network_data(&networks, state, 0.75), network_data);
         frame.render_widget(memory_gauges(&sys), mem);
         frame.render_widget(disk_gauges(&sys), disk);
         frame.render_widget(process_list(&sys, state), bottom);
@@ -1196,6 +1287,8 @@ fn main() -> io::Result<()> {
     let mut terminal = ratatui::init();
 
     let mut sys = System::new_all();
+
+    let mut networks = Networks::new_with_refreshed_list();
     
     
    let processes_tree: Vec<Rc<RefCell<TreeProc>>> = Tree_create();
@@ -1219,10 +1312,12 @@ let mut state = AppState::new(15, processes_tree, Rc::clone(&root_proc), root_pr
         if !state.frozen {
             sys.refresh_all();
         }
+
+        networks.refresh(true);
         
         let total_processes = sys.processes().len();
 
-        terminal.draw(|frame| draw_ui(&sys, & mut state, frame,tree))?;
+        terminal.draw(|frame| draw_ui(&sys, &networks, & mut state, frame,tree))?;
 
         // Handle keyboard input for scrolling and process management
         if crossterm::event::poll(std::time::Duration::from_millis(750))? {
