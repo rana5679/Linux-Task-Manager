@@ -3,8 +3,9 @@ use std::io::{stdout};
 use std::rc::Rc;
 use sysinfo::{System, Pid};
 use std::io;
+use std::fs;
 use crossterm::{
-    event::{self, Event, KeyCode,DisableMouseCapture,EnableMouseCapture},
+    event::{self, Event, KeyCode, KeyModifiers,DisableMouseCapture,EnableMouseCapture},
     execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -15,7 +16,8 @@ use ratatui::{
     buffer::Buffer, backend::CrosstermBackend,   widgets::{Block, Borders, Paragraph},
     Terminal,
 };
-
+use std::path::Path;
+use procfs::{process::Process, ProcResult, WithCurrentSystemInfo};
 use nix::sys::{self, signal::{kill, Signal}};
 use nix::unistd::Pid as NixPid;
 use libc::{getpriority, PRIO_PROCESS};
@@ -179,6 +181,7 @@ struct AppState {
     proc_tree: Vec<Rc<RefCell<TreeProc>>>, // contains the vector of processes with their children
     root_proc: Rc<RefCell<TreeProc>>, // gets the root process and its children
     curr_sel: u32, // gets the pid of the selected process
+    thread_process: Pid, // stores the process whose thread data is being displayed 
 }
 
 impl AppState {
@@ -204,6 +207,7 @@ impl AppState {
             proc_tree,
             root_proc,
             curr_sel,
+            thread_process: Pid::from(1),
         }
     }
 
@@ -300,7 +304,18 @@ fn send_signal_to_selected_process(
     }
 }
 
+fn selected_pid(state: &AppState) ->Pid{
+    if let Some(pids) = &state.cached_pids {
+        let index = state.scroll_position + state.selected_index;
+        if index < pids.len() {
+            return pids[index]
+        }
+    }
 
+    // Returns the currently selected PID from the cached list.
+    // If the selection is invalid, returns PID 1 (init/systemd) as a failsafe.
+    sysinfo::Pid::from(1)
+}
 
 fn help_panel<'a>() -> Paragraph<'a> {
     let left_text = vec![
@@ -455,7 +470,8 @@ fn cpu_info(sys: &sysinfo::System) -> Table{
         &[ratatui::layout::Constraint::Percentage(20), 
         ratatui::layout::Constraint::Percentage(30),
         ratatui::layout::Constraint::Percentage(20),
-        ratatui::layout::Constraint::Percentage(30)])
+        ratatui::layout::Constraint::Percentage(30)
+        ])
         .block(
             Block::default()
                 .title(Span::styled(
@@ -590,6 +606,152 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
     )).borders(Borders::ALL))
     .column_spacing(1)
 }
+
+// Helper function to format bytes into human-readable units
+fn bytes_to_human(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut size = bytes as f64;
+    let mut unit_idx = 0;
+
+    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+
+    format!("{:.1} {}", size, UNITS[unit_idx])
+}
+
+fn get_overall_thread_data<'a>(sys: &'a sysinfo::System, app: &'a AppState)-> Table<'a> {
+    
+    let mut name = String::new();
+    let mut memory = 0;
+
+    if let Some(process) = sys.process(app.thread_process)
+    {
+        name = process.name().to_string_lossy().into_owned();
+        memory = process.memory();
+    }
+    
+    let thread_count = fs::read_dir(format!("/proc/{}/task", app.thread_process))
+    .map(|dir| dir.count())
+    .unwrap_or(0);
+
+    let rows = vec![
+        Row::new(vec![
+            Cell::from("Process name".to_string()),
+            Cell::from(name),
+        ]),
+        Row::new(vec![
+            Cell::from("Thread count".to_string()),
+            Cell::from(thread_count.to_string()),
+        ]),
+        Row::new(vec![
+            Cell::from("Memory".to_string()),
+            Cell::from(bytes_to_human(memory)),
+        ]),
+    ];
+
+    Table::new(rows,
+        &[ratatui::layout::Constraint::Percentage(25), 
+        ratatui::layout::Constraint::Percentage(75)])
+        .block(Block::default()
+        .title(Span::styled(
+            "Process Data", 
+            Style::default().add_modifier(Modifier::BOLD)
+        ))
+        .borders(Borders::ALL))
+
+}
+
+#[derive(Debug, Default)]
+struct ThreadInfo {
+    tid: u32,
+    name: String,
+    state: String,
+    utime: u64,
+    stime: u64,
+    priority: i64,
+    nice: i64,
+    voluntary_ctxt_switches: u64,
+    nonvoluntary_ctxt_switches: u64,
+}
+
+fn get_thread_info(pid: i32) -> ProcResult<Vec<ThreadInfo>> {
+    let process = Process::new(pid)?;
+    let tasks = process.tasks()?;
+
+    tasks
+        .map(|task_result| {
+            let task = task_result?; // Propagates task enumeration errors
+            let stat = task.stat()?; // Propagates stat parsing errors
+
+
+            Ok(ThreadInfo { // Wrap in Ok()
+                tid: task.tid as u32,
+                name: stat.comm,
+                state: stat.state.to_string(),
+                utime: stat.utime,
+                stime: stat.stime,
+                priority: stat.priority,
+                nice: stat.nice,
+                ..ThreadInfo::default()
+            })
+    })
+    .collect()
+}
+
+
+fn thread_info_to_table<'a>(pid: Pid) -> Table<'a>{
+    // Convert clock ticks to seconds (Linux default is 100 ticks/sec)
+    let ticks_per_sec = procfs::ticks_per_second() as f64;
+
+    let pid = pid.as_u32() as i32;
+
+    let threads = get_thread_info(pid).unwrap_or_default();
+
+    let header_style = Style::default()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD);
+
+    let rows: Vec<Row> = threads.iter().map(|t| {
+        // Format CPU times as seconds with 2 decimal places
+        let utime_sec = (t.utime as f64) / ticks_per_sec;
+        let stime_sec = (t.stime as f64) / ticks_per_sec;
+
+        Row::new(vec![
+            Cell::from(t.tid.to_string()),
+            Cell::from(t.name.clone()),
+            Cell::from(t.state.clone()),
+            Cell::from(format!("{:.2}", utime_sec)),
+            Cell::from(format!("{:.2}", stime_sec)),
+            Cell::from(t.priority.to_string()),
+            Cell::from(t.nice.to_string()),
+        ])
+        }).collect();
+
+        Table::new(rows, [
+            Constraint::Length(6),   // TID
+            Constraint::Length(16),  // Name
+            Constraint::Length(6),   // State
+            Constraint::Length(8),   // User CPU
+            Constraint::Length(8),   // Sys CPU
+            Constraint::Length(5),   // Priority
+            Constraint::Length(5),   // Nice
+        ])
+        .header(
+            Row::new(vec!["TID", "Name", "State", "User", "Sys", "Prio", "Nice", "Memory"])
+                .style(header_style)
+        )
+        .block(Block::default()
+        .title(Span::styled(
+            "Thread Data", 
+            Style::default().add_modifier(Modifier::BOLD)
+        ))
+        .borders(Borders::ALL))
+        .column_spacing(1)
+            
+}
+
 
 fn calculate_graph_x_ticks(area_width: u16)-> usize {
     let max_x_ticks = area_width;
@@ -1076,7 +1238,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         .style(Style::default().bg(Color::Black));
     frame.render_widget(background, area);
 
-    // 🧠 If tree mode is enabled, draw tree and return early
+    // If tree mode is enabled, draw tree and return early
     if tree {
         let tree_proc = vec![Rc::clone(&state.root_proc)];
         let tree_text = Tree_display(tree_proc, 0, state.curr_sel);
@@ -1130,15 +1292,14 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
             Constraint::Fill(1)
         ]).areas(top);
 
-        let [cpu, network, mem_disk] = Layout::horizontal([
-            Constraint::Fill(1),
-            Constraint::Fill(1),
+        let [cpu, mem_disk] = Layout::horizontal([
+            Constraint::Fill(2),
             Constraint::Fill(1)
         ]).areas(middle);
 
-        let [cpus, cpu_graph] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Fill(1)
+        let [cpus, cpu_graph] = Layout::horizontal([
+            Constraint::Fill(2),
+            Constraint::Fill(3)
         ]).areas(cpu);
 
         let [mem, disk] = Layout::vertical([
@@ -1146,13 +1307,26 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
             Constraint::Fill(1)
         ]).areas(mem_disk);
 
-        frame.render_widget(system_info(&sys), systeminfo);
-        frame.render_widget(usage_info(&sys), useageinfo);
+        let [process, thread] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Fill(1)
+        ]).areas(bottom);
+
+        let [thread_general, per_thread] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Fill(4)
+        ]).areas(thread);
+
+        frame.render_widget(system_info(&sys), top);
+        // frame.render_widget(usage_info(&sys), useageinfo);
         frame.render_widget(cpu_info(&sys), cpus);
         frame.render_widget(get_cpu_graph(&sys, state, cpu_graph), cpu_graph);
         frame.render_widget(memory_gauges(&sys), mem);
         frame.render_widget(disk_gauges(&sys), disk);
-        frame.render_widget(process_list(&sys, state), bottom);
+        frame.render_widget(process_list(&sys, state), process);
+        frame.render_widget(get_overall_thread_data(&sys, &state), thread_general);
+        frame.render_widget(thread_info_to_table(state.thread_process), per_thread);
+        
     }
 }
 
@@ -1290,9 +1464,15 @@ let mut state = AppState::new(15, processes_tree, Rc::clone(&root_proc), root_pr
                         }
                     },
                     
-                    KeyCode::Char('t') => {
+                    KeyCode::Char('t') if key.modifiers.is_empty() => {
                         tree = !tree;
                         stack_proc(&mut stack, &state.root_proc.clone());
+                    },
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let pt_pid = selected_pid(&state);
+                        if Path::new(&format!("/proc/{}", pt_pid)).exists(){
+                            state.thread_process = pt_pid;
+                        }
                     },
                     _ => {}
                 }
