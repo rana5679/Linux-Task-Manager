@@ -2,9 +2,10 @@ use std::cell::RefCell;
 use std::io::{stdout};
 use std::rc::Rc;
 use sysinfo::{System, Pid};
-use std::io; 
+use std::io;
+use std::fs;
 use crossterm::{
-    event::{self, Event, KeyCode,DisableMouseCapture,EnableMouseCapture},
+    event::{self, Event, KeyCode, KeyModifiers,DisableMouseCapture,EnableMouseCapture},
     execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -15,10 +16,14 @@ use ratatui::{
     buffer::Buffer, backend::CrosstermBackend,   widgets::{Block, Borders, Paragraph},
     Terminal,
 };
+use std::path::Path;
 
+use procfs::{process::Process, ProcResult, WithCurrentSystemInfo, Uptime, Current};
 use nix::sys::{self, signal::{kill, Signal}};
 use nix::unistd::Pid as NixPid;
-use libc::{getpriority, PRIO_PROCESS};
+use libc::{getpriority, PRIO_PROCESS, pid_t, c_int, syscall, SYS_tgkill};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 #[derive(Eq, PartialEq)]
 // struct representing each process and its information
@@ -176,23 +181,51 @@ fn stack_proc(procs: &mut Vec<Rc<RefCell<TreeProc>>>, parent: &Rc<RefCell<TreePr
 
 
 /// Enum to define sorting modes for the process list
+#[derive(PartialEq, Debug)]
 enum SortMode {
     Cpu,
     Memory,
     Pid,
 }
 
+#[derive(PartialEq, Clone)]
+enum Mode {
+    Proc,
+    Thread,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ThreadInfo {
+    tid: u32,
+    name: String,
+    state: String,
+    cpu: f64,
+    priority: i64,
+
+}
+
+struct ThreadSample {
+    last_cpu_time: u64,  // utime + stime
+    last_seen: Instant,
+}
+
 /// Struct to manage application state
 struct AppState {
-    scroll_position: usize,
-    show_count: usize,
-    sort_mode: SortMode,
+    mode: Mode,
+    proc_scroll_position: usize,
+    thread_scroll_position: usize,
+    proc_show_count: usize,
+    thread_show_count: usize,
+    proc_sort_mode: SortMode,
+    thread_sort_mode: SortMode,
     frozen: bool,
     cached_pids: Option<Vec<Pid>>,
-    selected_index: usize,  // Added for process selection
+    cached_threads: Option<Vec<ThreadInfo>>,
+    proc_selected_index: usize,  // Added for process selection
+    thread_selected_index: usize,
     show_help: bool,        // Added for help panel toggle
     killed_pids: Vec<Pid>, // Track killed processes
-    g1_data: Vec<(f64, f64)>, // track data points for graph 1
+    cpu_graph: Vec<(f64, f64)>, // track data points for graph 1
     memory_data: Vec<(f64, f64)>,    // Memory usage over time
     swap_data: Vec<(f64, f64)>,      // Swap usage over time
     disk_data: Vec<(f64, f64)>,      // Disk usage over time
@@ -201,25 +234,35 @@ struct AppState {
     curr_sel: u32, // gets the pid of the selected process
     sel: bool, // used to identify which process is selected for killing
     scroll_offset: usize,
+    thread_process_pid: Pid, // stores the process whose thread data is being displayed 
+    thread_samples: HashMap<i32,ThreadSample>,
+    latest_thread_count: usize,
 }
 
 impl AppState {
   fn new(
-        show_count: usize,
+        proc_show_count: usize,
+        thread_show_count: usize,
         proc_tree: Vec<Rc<RefCell<TreeProc>>>,
         root_proc: Rc<RefCell<TreeProc>>,
         curr_sel: u32,
     ) -> Self {
         Self {
-            scroll_position: 0,
-            show_count,
-            sort_mode: SortMode::Cpu,
+            mode: Mode::Proc,
+            proc_scroll_position: 0,
+            thread_scroll_position: 0,
+            proc_show_count,
+            thread_show_count,
+            proc_sort_mode: SortMode::Cpu,
+            thread_sort_mode: SortMode::Cpu,
             frozen: false,
             cached_pids: None,
-            selected_index: 0,
+            cached_threads: None,
+            proc_selected_index: 0,
+            thread_selected_index: 0,
             show_help: false,
             killed_pids: Vec::new(),
-            g1_data: Vec::new(),
+            cpu_graph: Vec::new(),
             memory_data: Vec::new(),
             swap_data: Vec::new(),
             disk_data: Vec::new(),
@@ -228,61 +271,112 @@ impl AppState {
             curr_sel,
             sel,
             scroll_offset: 0,
+            thread_process_pid: Pid::from(1),
+            thread_samples: HashMap::new(),
+            latest_thread_count: 1,
         }
     }
 
     fn scroll_down(&mut self, total_processes: usize) {
-        if self.scroll_position + self.show_count < total_processes {
-            self.scroll_position += 1;
+        if self.proc_scroll_position + self.proc_show_count < total_processes {
+            self.proc_scroll_position += 1;
         }
     }
 
     fn scroll_up(&mut self) {
-        if self.scroll_position > 0 {
-            self.scroll_position -= 1;
+        if self.proc_scroll_position > 0 {
+            self.proc_scroll_position -= 1;
         }
     }
 
     fn page_down(&mut self, total_processes: usize) {
-        // add the number of elements shown to the current scroll position
-        let new_position = self.scroll_position + self.show_count;
-        // select the minimum of the new position, and the largest possible position
-        self.scroll_position = std::cmp::min(new_position, total_processes.saturating_sub(self.show_count));
+
+        if self.mode == Mode::Proc {
+            // add the number of elements shown to the current scroll position
+            let new_position = self.proc_scroll_position + self.proc_show_count;
+            // select the minimum of the new position, and the largest possible position
+            self.proc_scroll_position = std::cmp::min(new_position, total_processes.saturating_sub(self.proc_show_count));
+        }
+        else{
+            // add the number of elements shown to the current scroll position
+            let new_position = self.thread_scroll_position + self.thread_show_count;
+            // select the minimum of the new position, and the largest possible position
+            self.thread_scroll_position = std::cmp::min(new_position, self.latest_thread_count.saturating_sub(self.thread_show_count));
+        }
     }
 
     fn page_up(&mut self) {
-        self.scroll_position = self.scroll_position.saturating_sub(self.show_count);
+        if self.mode == Mode::Proc {
+            self.proc_scroll_position = self.proc_scroll_position.saturating_sub(self.proc_show_count);
+        }
+        else {
+            self.thread_scroll_position = self.thread_scroll_position.saturating_sub(self.thread_show_count);
+        }
     }
     
     fn toggle_freeze(&mut self) {
         self.frozen = !self.frozen;
     }
 
-    fn change_sort_mode(&mut self, mode: SortMode) {
-        self.sort_mode = mode;
-        // Reset cached processes when changing sort mode
-        self.cached_pids = None;
+    fn change_sort_mode(&mut self, sortmode: SortMode) {
+        
+        match self.mode
+        {
+            Mode::Proc => {
+                self.proc_sort_mode = sortmode;
+            // Reset cached processes when changing sort mode
+                self.cached_pids = None;
+            }
+            Mode::Thread => {
+                self.thread_sort_mode = sortmode;
+                self.cached_threads = None;
+            }
+        }
     }
+        
     
     // Added methods for selection navigation
     fn select_next(&mut self, total_processes: usize) {
-        // if the selected index is within the bounds of currently visible elements and total number of processes, select next
-        if self.selected_index < self.show_count - 1 && 
-           self.scroll_position + self.selected_index + 1 < total_processes {
-            self.selected_index += 1;
-        } // else if the next selected item is still within total number of elements, move the scroll position downwards
-         else if self.scroll_position + self.show_count < total_processes {
-            self.scroll_position += 1;
+        if self.mode == Mode::Proc {
+            // if the selected index is within the bounds of currently visible elements and total number of processes, select next
+            if self.proc_selected_index < self.proc_show_count - 1 && 
+            self.proc_scroll_position + self.proc_selected_index + 1 < total_processes {
+                self.proc_selected_index += 1;
+            } // else if the next selected item is still within total number of elements, move the scroll position downwards
+            else if self.proc_scroll_position + self.proc_show_count < total_processes {
+                self.proc_scroll_position += 1;
+            }
+        }
+        else{
+            // if the selected index is within the bounds of currently visible elements and total number of processes, select next
+            if self.thread_selected_index < self.thread_show_count - 1 && 
+            self.thread_scroll_position + self.thread_selected_index + 1 < self.latest_thread_count {
+                self.thread_selected_index += 1;
+            } // else if the next selected item is still within total number of elements, move the scroll position downwards
+            else if self.thread_scroll_position + self.thread_show_count < self.latest_thread_count {
+                self.thread_scroll_position += 1;
+            }
         }
     }
     
     fn select_previous(&mut self) {
-        // if the to be selected item is in the list of showing elements
-        if self.selected_index > 0 {
-            self.selected_index -= 1;
-        } // else if the to be selected element is within bounds
-         else if self.scroll_position > 0 {
-            self.scroll_position -= 1;
+        if self.mode == Mode::Proc {
+            // if the to be selected item is in the list of showing elements
+            if self.proc_selected_index > 0 {
+                self.proc_selected_index -= 1;
+            } // else if the to be selected element is within bounds
+            else if self.proc_scroll_position > 0 {
+                self.proc_scroll_position -= 1;
+            }
+        }
+        else{
+                // if the to be selected item is in the list of showing elements
+                if self.thread_selected_index > 0 {
+                    self.thread_selected_index -= 1;
+                } // else if the to be selected element is within bounds
+                else if self.thread_scroll_position > 0 {
+                    self.thread_scroll_position -= 1;
+                }
         }
     }
     
@@ -298,8 +392,8 @@ fn send_signal_to_selected_process(
     signal: Signal
 ) -> Result<(), nix::Error> {
     if let Some(pids) = &state.cached_pids {
-        if state.scroll_position + state.selected_index < pids.len() {
-            let index = state.scroll_position + state.selected_index;
+        if state.proc_scroll_position + state.proc_selected_index < pids.len() {
+            let index = state.proc_scroll_position + state.proc_selected_index;
             let pid = pids[index];
 
             // Verify process still exists
@@ -324,7 +418,45 @@ fn send_signal_to_selected_process(
     }
 }
 
+fn send_thread_signal( state: &mut AppState, signal: c_int) -> Result<(), nix::Error>  {
 
+    if let Some(threads) = &state.cached_threads {
+        if state.thread_scroll_position + state.thread_selected_index < state.latest_thread_count {
+            let index = state.thread_scroll_position + state.thread_selected_index;
+            let thread = &threads[index];
+
+            let tgid = state.thread_process_pid;
+            let result = unsafe { syscall(SYS_tgkill, tgid, thread.tid, signal) };
+
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(nix::Error::ESRCH)
+            }
+        } else {
+            Err(nix::Error::ESRCH)
+            }
+    } else {
+        Err(nix::Error::ESRCH)
+    }
+
+    
+   
+}
+
+// to get the selected process to display its threads
+fn selected_pid(state: &AppState) -> Pid{
+    if let Some(pids) = &state.cached_pids {
+        let index = state.proc_scroll_position + state.proc_selected_index;
+        if index < pids.len() {
+            return pids[index]
+        }
+    }
+
+    // Returns the currently selected PID from the cached list.
+    // If the selection is invalid, returns PID 1 (init/systemd) as a failsafe.
+    sysinfo::Pid::from(1)
+}
 
 fn help_panel<'a>() -> Paragraph<'a> {
     let left_text = vec![
@@ -479,7 +611,8 @@ fn cpu_info(sys: &sysinfo::System) -> Table{
         &[ratatui::layout::Constraint::Percentage(20), 
         ratatui::layout::Constraint::Percentage(30),
         ratatui::layout::Constraint::Percentage(20),
-        ratatui::layout::Constraint::Percentage(30)])
+        ratatui::layout::Constraint::Percentage(30)
+        ])
         .block(
             Block::default()
                 .title(Span::styled(
@@ -499,7 +632,7 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
         let mut pids: Vec<Pid> = sys.processes().keys().copied().collect();
         
         // Sort based on selected sort mode
-        match state.sort_mode {
+        match state.proc_sort_mode {
             SortMode::Cpu => {
                 pids.sort_by(|a, b| {
                     let proc_a = sys.process(*a).unwrap();
@@ -532,14 +665,14 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
     
     // Calculate visible range based on scroll position
     let total = pids.len();
-    let start = state.scroll_position;
-    let _end = std::cmp::min(start + state.show_count, total);
+    let start = state.proc_scroll_position;
+    let _end = std::cmp::min(start + state.proc_show_count, total);
     
     // Create rows only for visible processes with selection highlighting
     let rows: Vec<Row> = pids
         .iter()
         .skip(start)
-        .take(state.show_count)
+        .take(state.proc_show_count)
         .enumerate()
         .filter_map(|(idx, pid)| {
             sys.process(*pid).map(|proc| {
@@ -554,8 +687,9 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
                     format!("{}", proc.status())
                 };
 
+                
                 // Highlight selected row
-                let style = if idx == state.selected_index {
+                let style = if idx == state.proc_selected_index && state.mode == Mode::Proc {
                     Style::default().bg(Color::Blue).fg(Color::White)
                 } else {
                     Style::default()
@@ -577,7 +711,7 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
 
     // Create table with title indicating status and function keys
     let freeze_status = if state.frozen { " [FROZEN]" } else { "" };
-    let sort_mode = match state.sort_mode {
+    let proc_sort_mode = match state.proc_sort_mode {
         SortMode::Cpu => "CPU",
         SortMode::Memory => "MEM",
         SortMode::Pid => "PID",
@@ -608,12 +742,204 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
     .block(Block::default().title(format!(
         "Processes [{}] [Sort: {}{}]{}",
         total,
-        sort_mode,
+        proc_sort_mode,
         freeze_status,
         f_key_info
     )).borders(Borders::ALL))
     .column_spacing(1)
 }
+
+// Helper function to format bytes into human-readable units
+fn bytes_to_human(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut size = bytes as f64;
+    let mut unit_idx = 0;
+
+    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_idx += 1;
+    }
+
+    format!("{:.1} {}", size, UNITS[unit_idx])
+}
+
+fn get_overall_process_data<'a>(sys: &'a sysinfo::System, app: &'a mut AppState)-> Table<'a> {
+    
+    let mut name = String::new();
+    let mut memory = 0;
+
+    if let Some(process) = sys.process(app.thread_process_pid)
+    {
+        name = process.name().to_string_lossy().into_owned();
+        memory = process.memory();
+    }
+    
+    let thread_count = fs::read_dir(format!("/proc/{}/task", app.thread_process_pid))
+    .map(|dir| dir.count())
+    .unwrap_or(0);
+
+    app.latest_thread_count = thread_count;
+
+    let rows = vec![
+        Row::new(vec![
+            Cell::from("Process name".to_string()),
+            Cell::from(name),
+        ]),
+        Row::new(vec![
+            Cell::from("Thread count".to_string()),
+            Cell::from(thread_count.to_string()),
+        ]),
+        Row::new(vec![
+            Cell::from("Memory".to_string()),
+            Cell::from(bytes_to_human(memory)),
+        ]),
+    ];
+
+    Table::new(rows,
+        &[ratatui::layout::Constraint::Percentage(25), 
+        ratatui::layout::Constraint::Percentage(75)])
+        .block(Block::default()
+        .title(Span::styled(
+            "Process Data", 
+            Style::default().add_modifier(Modifier::BOLD)
+        ))
+        .borders(Borders::ALL))
+
+}
+
+
+
+fn get_thread_info(state: & mut AppState) -> ProcResult<Vec<ThreadInfo>> {
+    
+    let pid = state.thread_process_pid.as_u32() as i32;
+    let process = Process::new(pid)?;
+    let tasks = process.tasks()?;
+    let now = Instant::now();
+    let clock_ticks = procfs::ticks_per_second() as f64;
+            
+
+    tasks
+        .map(|task_result| {
+            let task = task_result?; // Propagates task enumeration errors
+            let stat = task.stat()?; // Propagates stat parsing errors
+            let total_cpu= stat.utime + stat.stime;
+            
+            let mut cpu_percent= 0.0;
+
+            if let Some(prev) = state.thread_samples.get(&task.tid) {
+                let elapsed = now.duration_since(prev.last_seen).as_secs_f64();
+                if elapsed > 0.0 {
+                        let delta_cpu = (total_cpu - prev.last_cpu_time) as f64 / clock_ticks;
+                        cpu_percent = 100.0 * (delta_cpu / elapsed);
+                }
+            }
+
+            state.thread_samples.insert(task.tid, ThreadSample {
+                last_cpu_time: total_cpu,
+                last_seen: now,
+            });
+
+
+            Ok(ThreadInfo { // Wrap in Ok()
+                tid: task.tid as u32,
+                name: stat.comm,
+                state: stat.state.to_string(),
+                cpu: cpu_percent,
+                priority: stat.priority,
+            })
+    })
+    .collect()
+}
+
+
+fn thread_info_to_table<'a>(state: &'a mut AppState) -> Table<'a>{
+    // Convert clock ticks to seconds (Linux default is 100 ticks/sec)
+  
+
+    let threads = if state.frozen && state.cached_threads.is_some() {
+        // used cached threads if frozen
+        state.cached_threads.as_ref().unwrap().clone()
+    } else{ 
+        let mut threads = get_thread_info(state).unwrap_or_default();
+
+        // Sort based on selected sort mode
+        match state.thread_sort_mode {
+            SortMode::Cpu => {
+                threads.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+            },
+            SortMode::Pid => {
+                threads.sort_by(|a, b| a.tid.cmp(&b.tid));
+            }
+            SortMode::Memory => {
+                threads.sort_by(|a, b| a.priority.cmp(&b.priority));
+            }
+        }
+
+        // Cache the sorted list if not frozen
+        if !state.frozen || state.cached_threads.is_none() {
+            state.cached_threads = Some(threads.clone());
+        }
+    
+        threads
+
+        };
+
+    let sort_mode = match state.thread_sort_mode {
+        SortMode::Cpu => "CPU",
+        SortMode::Pid => "TID",
+        SortMode::Memory => "PRIO",
+    };
+
+    let header_style = Style::default()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD);
+
+    let start = state.thread_scroll_position;
+
+    let rows: Vec<Row> = threads.iter()
+    .skip(start)
+    .take(state.thread_show_count)
+    .enumerate()
+    .map(|(idx,t)| 
+        
+        {
+
+        // Highlight selected row
+        let style = if idx == state.thread_selected_index && state.mode == Mode::Thread {
+            Style::default().bg(Color::Blue).fg(Color::White)
+        } else {
+            Style::default()
+        };
+
+        Row::new(vec![
+            Cell::from(t.tid.to_string()),
+            Cell::from(t.name.clone()),
+            Cell::from(t.state.clone()),
+            Cell::from(format!("{:.2}%", t.cpu)),
+            Cell::from(t.priority.to_string()),
+        ]).style(style)
+        }).collect();
+
+        Table::new(rows, [
+            Constraint::Length(6),   // TID
+            Constraint::Length(16),  // Name
+            Constraint::Length(6),   // State
+            Constraint::Length(8),   // CPU
+            Constraint::Length(5),   // Priority
+        ])
+        .header(
+            Row::new(vec!["TID", "Name", "State", "CPU%", "Prio"])
+                .style(header_style)
+        )
+        .block(Block::default().title(format!(
+            "Thread Data [Sort: {}]",
+            sort_mode,
+        )).borders(Borders::ALL)
+        )
+        .column_spacing(1)
+            
+}
+
 
 fn calculate_graph_x_ticks(area_width: u16)-> usize {
     let max_x_ticks = area_width;
@@ -652,20 +978,20 @@ fn calculate_x_bounds(data: &Vec<(f64, f64)>, x_ticks: usize)-> (f64, f64) {
 // fn cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect) ->canvas::Canvas<'a, impl Fn(&mut canvas::Context) + 'a>{
 
 //     // preparing the new point
-//     let new_x = app.g1_data.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
+//     let new_x = app.cpu_graph.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
 //     let new_y = sys.global_cpu_usage() as f64;
-//     app.g1_data.push((new_x, new_y));
+//     app.cpu_graph.push((new_x, new_y));
 
 //     let width = area.width; let height = area.height;
     
 //     let x_ticks = calculate_graph_x_ticks(width);
 
-//     let x_bounds = calculate_x_bounds(&app.g1_data, x_ticks);
+//     let x_bounds = calculate_x_bounds(&app.cpu_graph, x_ticks);
 
 //     let x_bounds = [x_bounds.0, x_bounds.1];
 
 
-//     let data = &app.g1_data;
+//     let data = &app.cpu_graph;
 
 
 //     canvas::Canvas::default()
@@ -691,26 +1017,26 @@ fn calculate_x_bounds(data: &Vec<(f64, f64)>, x_ticks: usize)-> (f64, f64) {
 
 fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect) ->Chart<'a>{
     
-    let new_x = app.g1_data.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
+    let new_x = app.cpu_graph.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
     let new_y = sys.global_cpu_usage() as f64;
 
-    app.g1_data.push((new_x, new_y));
+    app.cpu_graph.push((new_x, new_y));
 
     let width = area.width;
     
     let x_ticks = calculate_graph_x_ticks(width);
 
-    let x_bounds = calculate_x_bounds(&app.g1_data, x_ticks);
+    let x_bounds = calculate_x_bounds(&app.cpu_graph, x_ticks);
 
     let x_bounds = [x_bounds.0, x_bounds.1];
 
-    if app.g1_data.len() > x_ticks{
-        app.g1_data.remove(0);
+    if app.cpu_graph.len() > x_ticks{
+        app.cpu_graph.remove(0);
     }
 
 
     let dataset = Dataset::default()
-    .data(&app.g1_data)
+    .data(&app.cpu_graph)
     .graph_type(GraphType::Bar)
     .marker(symbols::Marker::Braille)
     .style(Style::default().fg(Color::Rgb(120, 200, 120)).bg(Color::Black));
@@ -730,8 +1056,8 @@ fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("CPU %")
-                .style(Style::default().bg(Color::Black)))
+                .title("CPU %"))
+        .style(Style::default().bg(Color::Black))
 
 }
 struct MemoryGauges<'a> {
@@ -1100,7 +1426,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         .style(Style::default().bg(Color::Black));
     frame.render_widget(background, area);
 
-    // 🧠 If tree mode is enabled, draw tree and return early
+    // If tree mode is enabled, draw tree and return early
     if tree {
        let tree_proc = vec![Rc::clone(&state.root_proc)];
         //let tree_text = Tree_display(tree_proc, 0, state.curr_sel,state.sel);
@@ -1124,7 +1450,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
     if state.show_help {
         // For help layout: calculate available space after system stats and help panel
         let available_height = area.height.saturating_sub(12 + 20 + 3);
-        state.show_count = available_height as usize;
+        state.proc_show_count = available_height as usize;
 
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -1150,9 +1476,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         frame.render_widget(help_panel(), layout[1]);
         frame.render_widget(process_list(&sys, state), layout[2]);
     } else {
-        let process_section_height = (area.height as f32 * 0.5).floor() as u16;
-        state.show_count = process_section_height.saturating_sub(3) as usize;
-
+        
         let [top, middle, bottom] = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Fill(2),
@@ -1164,15 +1488,14 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
             Constraint::Fill(1)
         ]).areas(top);
 
-        let [cpu, network, mem_disk] = Layout::horizontal([
-            Constraint::Fill(1),
-            Constraint::Fill(1),
+        let [cpu, mem_disk] = Layout::horizontal([
+            Constraint::Fill(2),
             Constraint::Fill(1)
         ]).areas(middle);
 
-        let [cpus, cpu_graph] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Fill(1)
+        let [cpus, cpu_graph] = Layout::horizontal([
+            Constraint::Fill(2),
+            Constraint::Fill(3)
         ]).areas(cpu);
 
         let [mem, disk] = Layout::vertical([
@@ -1180,13 +1503,32 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
             Constraint::Fill(1)
         ]).areas(mem_disk);
 
-        frame.render_widget(system_info(&sys), systeminfo);
-        frame.render_widget(usage_info(&sys), useageinfo);
+        let [process, thread] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Fill(1)
+        ]).areas(bottom);
+
+        let [thread_general, per_thread] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Fill(4)
+        ]).areas(thread);
+
+
+        let process_section_height = (process.height as f32).floor() as u16;
+        state.proc_show_count = ((process_section_height.saturating_sub(3)) as f64) as usize;
+
+        let thread_section_height = (per_thread.height as f32).floor() as u16;
+        state.thread_show_count = ((thread_section_height.saturating_sub(3)) as f64) as usize;
+        frame.render_widget(system_info(&sys), top);
+        // frame.render_widget(usage_info(&sys), useageinfo);
         frame.render_widget(cpu_info(&sys), cpus);
         frame.render_widget(get_cpu_graph(&sys, state, cpu_graph), cpu_graph);
         frame.render_widget(memory_gauges(&sys), mem);
         frame.render_widget(disk_gauges(&sys), disk);
-        frame.render_widget(process_list(&sys, state), bottom);
+        frame.render_widget(process_list(&sys, state), process);
+        frame.render_widget(get_overall_process_data(&sys, state), thread_general);
+        frame.render_widget(thread_info_to_table(state), per_thread);
+        
     }
 }
 
@@ -1236,7 +1578,9 @@ fn main() -> io::Result<()> {
    let root_index = find_root(&processes_tree).unwrap();
    let root_proc = Rc::clone(&processes_tree[root_index]); 
 
-let mut state = AppState::new(15, processes_tree, Rc::clone(&root_proc), root_proc.borrow().get_pid());
+
+let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), root_proc.borrow().get_pid());
+
     
     let mut tree:bool = false;
     let mut i = 0; // index into the  tree stack
@@ -1273,12 +1617,18 @@ let mut state = AppState::new(15, processes_tree, Rc::clone(&root_proc), root_pr
                         if tree{
                             state.scroll_offset += 1;
                         }
+                        else{
+                          state.mode = Mode::Proc;
+                        }
                     },
                     
                     KeyCode::Right => {
                         if tree{
                             state.scroll_offset = state.scroll_offset.saturating_sub(1);
                         }
+                       else {
+                         state.mode = Mode::Thread;
+                       }
                     },
                     
                     // Selection navigation
@@ -1310,13 +1660,13 @@ let mut state = AppState::new(15, processes_tree, Rc::clone(&root_proc), root_pr
                             state.select_previous()
                         }
                     },
-                    
+                  
                     KeyCode::PageDown => state.page_down(total_processes),
                     KeyCode::PageUp => state.page_up(),
                     
                     // Process management
                     KeyCode::Char('h') => state.toggle_help(),
-                     KeyCode::Char('k') => {
+                    KeyCode::Char('k') => {
                         if tree{
                             for proc in &stack {
                                 if proc.borrow().get_selected() == true{
@@ -1333,11 +1683,18 @@ let mut state = AppState::new(15, processes_tree, Rc::clone(&root_proc), root_pr
                       }
                     },
                     KeyCode::Char('u') => {
-                        if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGKILL) {
-                            eprintln!("Error sending SIGKILL: {}", e);
+                        if state.mode == Mode::Proc {
+                            if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGKILL) {
+                                eprintln!("Error sending SIGKILL: {}", e);
+                            }
+                        }
+                        else{
+                            if let Err(e) = send_thread_signal(& mut state, libc::SIGKILL) {
+                                eprintln!("Error sending SIGKILL: {}", e);
+                            }
                         }
                     },                    
-                     KeyCode::Char('s') => {
+                      KeyCode::Char('s') => {
                         if tree{
                             if let Some(proc) = stack.get(i) {
                                 proc.borrow_mut().set_selected(true);
@@ -1359,14 +1716,30 @@ let mut state = AppState::new(15, processes_tree, Rc::clone(&root_proc), root_pr
                     },
                     
                     KeyCode::Char('r') => {
-                        if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGCONT) {
-                            eprintln!("Error sending SIGCONT: {}", e);
+                        if state.mode == Mode::Proc {
+                            if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGCONT) {
+                                eprintln!("Error sending SIGCONT: {}", e);
+                            }
+                        }
+                        else{
+                            if let Err(e) = send_thread_signal(& mut state, libc::SIGCONT) {
+                                eprintln!("Error sending SIGCONT: {}", e);
+                            }
                         }
                     },
                     
-                    KeyCode::Char('t') => {
+                    KeyCode::Char('t') if key.modifiers.is_empty() => {
                         tree = !tree;
                         stack_proc(&mut stack, &state.root_proc.clone());
+                    },
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let pt_pid = selected_pid(&state);
+                        if Path::new(&format!("/proc/{}", pt_pid)).exists(){
+                            state.thread_process_pid = pt_pid;
+                            state.thread_scroll_position = 0;
+                            state.thread_selected_index = 0;
+                            state.cached_threads = None;
+                        }
                     },
                     _ => {}
                 }
