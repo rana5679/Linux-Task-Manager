@@ -1,12 +1,10 @@
 use std::cell::RefCell;
-use std::io::{stdout};
 use std::rc::Rc;
 use sysinfo::{System, Pid};
 use std::io;
 use std::fs;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers,DisableMouseCapture,EnableMouseCapture},
-    execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
     },
@@ -19,6 +17,7 @@ use ratatui::{
 use std::path::Path;
 use procfs::{process::Process, ProcResult, WithCurrentSystemInfo, Uptime, Current};
 use nix::sys::{self, signal::{kill, Signal}};
+use nix::errno::Errno;
 use nix::unistd::Pid as NixPid;
 use libc::{getpriority, PRIO_PROCESS, pid_t, c_int, syscall, SYS_tgkill};
 use std::collections::HashMap;
@@ -211,9 +210,13 @@ struct AppState {
     proc_tree: Vec<Rc<RefCell<TreeProc>>>, // contains the vector of processes with their children
     root_proc: Rc<RefCell<TreeProc>>, // gets the root process and its children
     curr_sel: u32, // gets the pid of the selected process
-    thread_process_pid: Pid, // stores the process whose thread data is being displayed 
+
+    thread_process: Pid, // stores the process whose thread data is being displayed 
     thread_samples: HashMap<i32,ThreadSample>,
     latest_thread_count: usize,
+    renice_prompt: bool,
+    renice_input: String,
+    renice_error: Option<String>,
 }
 
 impl AppState {
@@ -246,9 +249,12 @@ impl AppState {
             proc_tree,
             root_proc,
             curr_sel,
-            thread_process_pid: Pid::from(1),
-            thread_samples: HashMap::new(),
+            thread_process: Pid::from(1),
+          thread_samples: HashMap::new(),
             latest_thread_count: 1,
+            renice_prompt: false,
+            renice_input: String::new(),
+            renice_error: None,
         }
     }
 
@@ -433,17 +439,32 @@ fn selected_pid(state: &AppState) -> Pid{
     sysinfo::Pid::from(1)
 }
 
+fn renice_process(pid: Pid, new_nice: i32) -> Result<(), nix::Error> {
+    let result = unsafe {
+        libc::setpriority(
+            libc::PRIO_PROCESS,
+            pid.as_u32() as libc::id_t,
+            new_nice as libc::c_int,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(Errno::last().into())
+    }
+}
+
 fn help_panel<'a>() -> Paragraph<'a> {
     let left_text = vec![
         Line::from(Span::styled(
             "Process Management:",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )),
-        Line::from("  K: Kill (SIGTERM)"),
-        Line::from("  U: Force Kill (SIGKILL)"),
+        Line::from("  K: Kill"),
+        Line::from("  U: Force Kill"),
         Line::from("  S: Suspend"),
         Line::from("  R: Resume"),
-        Line::from(""),
+        Line::from("  N: Renice Process"),
         Line::from(Span::styled(
             "Navigation:",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -655,6 +676,22 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
                 // top and htop display raw cpu so using that
                 let normalized_cpu = proc.cpu_usage() / cpu_count;
 
+                let cpu_time_ms = proc.accumulated_cpu_time();
+                let cpu_time_str = ms_to_human(cpu_time_ms);
+                let prio = procfs::process::Process::new(pid.as_u32() as i32)
+                    .and_then(|p| p.stat())
+                    .map(|stat| stat.priority)
+                    .unwrap_or_default();
+
+                
+                let disk_usage = proc.disk_usage();
+                let disk_read_str = bytes_to_human(disk_usage.total_read_bytes);
+                let disk_write_str = bytes_to_human(disk_usage.total_written_bytes);
+                let thread_count = std::fs::read_dir(format!("/proc/{}/task", pid.as_u32()))
+                    .map(|dir| dir.count())
+                    .unwrap_or(0);
+
+
                 // Check if the process is marked as killed
                 let status = if state.killed_pids.contains(pid) {
                     "Killed".to_string()
@@ -675,9 +712,14 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
                     pid.to_string(),
                     proc.name().to_string_lossy().to_string(),
                     unsafe { getpriority(PRIO_PROCESS, pid.as_u32()) }.to_string(),
+                    prio.to_string(),
                     status,  // Display custom status here
                     format!("{:.2}%", proc.cpu_usage()),
                     format!("{:.2}%", (proc.memory() as f64 / total_mem) * 100.0 ),
+                    cpu_time_str,                  
+                    disk_read_str,          
+                    disk_write_str, 
+                    thread_count.to_string(),        
                 ]).style(style)
             })
         })
@@ -702,17 +744,27 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
         Constraint::Length(8),       // PID column width
         Constraint::Percentage(30),  // Process name column width
         Constraint::Length(5),       // Nice values column width 
+        Constraint::Length(10),       // Priority column width
         Constraint::Length(10),      // State column width
         Constraint::Length(12),      // CPU usage column width
         Constraint::Length(15),      // Memory usage column width
+        Constraint::Length(10),      
+        Constraint::Length(14),     
+        Constraint::Length(14), 
+        Constraint::Length(8),
     ])
     .header(Row::new(vec![
         "PID".to_string(),
         "Process Name".to_string(),
         "NI".to_string(),
+        "Priority".to_string(),
         "State".to_string(),       
         "CPU Usage".to_string(),
         "Memory Usage".to_string(),
+        "CPU Time".to_string(),     
+        "Disk Read".to_string(),    
+        "Disk Write".to_string(), 
+        "Threads".to_string(),
     ]).style(Style::default().add_modifier(Modifier::BOLD)))
     .block(Block::default().title(format!(
         "Processes [{}] [Sort: {}{}]{}",
@@ -736,6 +788,12 @@ fn bytes_to_human(bytes: u64) -> String {
     }
 
     format!("{:.1} {}", size, UNITS[unit_idx])
+}
+fn ms_to_human(ms: u64) -> String {
+    let secs = ms / 1000;
+    let mins = secs / 60;
+    let hours = mins / 60;
+    format!("{:02}:{:02}:{:02}", hours, mins % 60, secs % 60)
 }
 
 fn get_overall_process_data<'a>(sys: &'a sysinfo::System, app: &'a mut AppState)-> Table<'a> {
@@ -990,6 +1048,8 @@ fn calculate_x_bounds(data: &Vec<(f64, f64)>, x_ticks: usize)-> (f64, f64) {
 //     })
 // }
 
+
+
 fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect) ->Chart<'a>{
     
     let new_x = app.cpu_graph.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
@@ -1031,8 +1091,7 @@ fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("CPU %")
-                )
+                .title("CPU %"))
         .style(Style::default().bg(Color::Black))
 
 }
@@ -1101,9 +1160,9 @@ impl<'a> MemoryGauges<'a> {
             cached_mem,
             free_mem,
             block: Block::default()
-                .title("mem")
+                .title("Mem")
                 .borders(Borders::ALL)
-                .style(Style::default().bg(Color::Black)),
+                .style(Style::default().bg(Color::Black).add_modifier(Modifier::BOLD)),
         }
     }
 }
@@ -1210,10 +1269,10 @@ impl<'a> DiskGauges<'a> {
         Self {
             sys,
             block: Block::default()
-                .title("disks")
+                .title("Disks")
                 // .border_style(Color::Rgb((20), (30), (40)))
                 .borders(Borders::ALL)
-                .style(Style::default().bg(Color::Black)),
+                .style(Style::default().bg(Color::Black).add_modifier(Modifier::BOLD)),
         }
     }
 }
@@ -1393,6 +1452,15 @@ fn disk_gauges(sys: &sysinfo::System) -> DiskGauges {
     DiskGauges::new(sys)
 }
 
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    Rect {
+        x: (area.width - width) / 2,
+        y: (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
 fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree: bool) {
     // Get dynamic terminal size
     let area = frame.area();
@@ -1412,6 +1480,38 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         frame.render_widget(tree_widget, area);
         return;
     }
+
+    if state.renice_prompt {
+        let prompt_area = centered_rect(30, 5, area);
+        let block = Block::default()
+            .title(" Renice Process ")
+            .borders(Borders::ALL)
+            .style(Style::default().bg(Color::Black));
+        
+        frame.render_widget(block, prompt_area);
+        
+        let input_area = prompt_area.inner(Margin::new(2, 2));
+        frame.render_widget(
+            Paragraph::new(state.renice_input.as_str())
+                .style(Style::default().fg(Color::Yellow)),
+            input_area
+        );
+        
+        // Render error message if present
+        if let Some(err) = &state.renice_error {
+            let error_area = Rect::new(
+                prompt_area.left(),
+                prompt_area.bottom() + 1,
+                prompt_area.width,
+                1
+            );
+            frame.render_widget(
+                Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)),
+                error_area
+            );
+        }
+    }
+    
 
     if state.show_help {
         // For help layout: calculate available space after system stats and help panel
@@ -1435,7 +1535,8 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
                 Constraint::Percentage(39),
             ])
             .split(layout[0]);
-
+        
+        
         frame.render_widget(system_info(&sys), upper_list_layout[0]);
         frame.render_widget(usage_info(&sys), upper_list_layout[1]);
         frame.render_widget(cpu_info(&sys), upper_list_layout[2]);
@@ -1533,16 +1634,18 @@ impl ColorExt for Color {
 }
 
 
-fn main() -> io::Result<()> {
+fn main() -> io::Result<()> 
+{
     // Initialize terminal
     let mut terminal = ratatui::init();
 
     let mut sys = System::new_all();
     
     
-   let processes_tree: Vec<Rc<RefCell<TreeProc>>> = Tree_create();
-   let root_index = find_root(&processes_tree).unwrap();
-   let root_proc = Rc::clone(&processes_tree[root_index]); 
+    let processes_tree: Vec<Rc<RefCell<TreeProc>>> = Tree_create();
+    let root_index = find_root(&processes_tree).unwrap();
+    let root_proc = Rc::clone(&processes_tree[root_index]); 
+
 
 let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), root_proc.borrow().get_pid());
     
@@ -1556,49 +1659,90 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
     std::thread::sleep(std::time::Duration::from_millis(500));
 
 
-    loop {
+    loop 
+    {
         // Only refresh if not frozen
         if !state.frozen {
             sys.refresh_all();
         }
+        terminal.draw(|frame| draw_ui(&sys, &mut state, frame, tree))?;
         
         let total_processes = sys.processes().len();
 
         terminal.draw(|frame| draw_ui(&sys, & mut state, frame,tree))?;
-
+        
         // Handle keyboard input for scrolling and process management
-        if crossterm::event::poll(std::time::Duration::from_millis(750))? {
-            if let Event::Key(key) = crossterm::event::read()? {
-                match key.code {
-                    // Navigation keys
-                    KeyCode::Char('q') => break,
-                    KeyCode::Char('f') => state.toggle_freeze(),
-                    KeyCode::Char('c') => state.change_sort_mode(SortMode::Cpu),
-                    KeyCode::Char('m') => state.change_sort_mode(SortMode::Memory),
-                    KeyCode::Char('p') => state.change_sort_mode(SortMode::Pid),
-                    
-                    // Selection navigation
-                    KeyCode::Down => {
-                        if tree{
-                            if i + 1 >= stack.len() {
-                                i = 0;
-                            }
-                        else{
-                            i = i + 1;
-                            }
-                        state.curr_sel = stack[i].borrow().get_pid();
-                        }
-                        else{
-                            state.select_next(total_processes)
-                        }
-                    },
-                    KeyCode::Up => {
-                        if tree{
-                            if i == 0 {
-                                i = stack.len() - 1 ; 
+        if crossterm::event::poll(std::time::Duration::from_millis(750))? 
+        {
+            if let Event::Key(key) = crossterm::event::read()? 
+            {
+                if state.renice_prompt 
+                {
+                    // Handle renice prompt input
+                    match key.code {
+                        KeyCode::Enter => {
+                            match state.renice_input.parse::<i32>() {
+                                Ok(nice) if (-20..=19).contains(&nice) => {
+                                    let pid = selected_pid(&state);
+                                    if let Err(e) = renice_process(pid, nice) {
+                                        state.renice_error = Some(format!("Error: {}", e));
+                                    } else {
+                                        state.renice_prompt = false;
+                                        state.renice_error = None;
+                                    }
                                 }
-                            else if i != 0{
-                                i = i - 1;
+                                _ => {
+                                    state.renice_error = Some("Invalid value! Must be between -20 and 19".into());
+                                }
+                            }
+                            state.renice_input.clear();
+                        }
+                        KeyCode::Char(c) if c.is_numeric() || c == '-' => {
+                            if c == '-' {
+                                if state.renice_input.is_empty() {
+                                    state.renice_input.push(c);
+                                }
+                            } else {
+                                state.renice_input.push(c);
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            state.renice_input.pop();
+                        }
+                        KeyCode::Esc => {
+                            state.renice_prompt = false;
+                            state.renice_error = None;
+                        }
+                        _ => {}
+                    }
+                } 
+                else 
+                {
+                    match key.code 
+                    {
+                        // Navigation keys
+                        KeyCode::Char('q') => break,
+                        KeyCode::Char('f') => state.toggle_freeze(),
+                        KeyCode::Char('c') => state.change_sort_mode(SortMode::Cpu),
+                        KeyCode::Char('m') => state.change_sort_mode(SortMode::Memory),
+                        KeyCode::Char('p') => state.change_sort_mode(SortMode::Pid),
+                        KeyCode::Char('n') => {
+                            if !state.renice_prompt {
+                                state.renice_prompt = true;
+                                state.renice_input.clear();
+                                state.renice_error = None;
+                            }
+                        },
+                        
+                        
+                        // Selection navigation
+                        KeyCode::Down => {
+                            if tree{
+                                if i + 1 >= stack.len() {
+                                    i = 0;
+                                }
+                            else{
+                                i = i + 1;
                                 }
                             state.curr_sel = stack[i].borrow().get_pid();
                         }
@@ -1606,6 +1750,23 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                             state.select_previous()
                         }
                     },
+                      
+                    KeyCode::Up => {
+                            if tree{
+                                if i == 0 {
+                                    i = stack.len() - 1 ; 
+                                    }
+                                else if i != 0{
+                                    i = i - 1;
+                                    }
+                                state.curr_sel = stack[i].borrow().get_pid();
+                            }
+                            else{
+                                state.select_previous()
+                            }
+                        },
+                      
+                      
                     KeyCode::Right => 
                     {
                         state.mode = Mode::Thread;
@@ -1676,11 +1837,11 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                     },
                     _ => {}
                 }
-                
+        
             }
         }
+        
     }
-
     ratatui::restore();
     Ok(())
 }
