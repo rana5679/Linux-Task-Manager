@@ -17,7 +17,7 @@ use ratatui::{
     Terminal,
 };
 use std::path::Path;
-
+use nix::errno::Errno;
 use procfs::{process::Process, ProcResult, WithCurrentSystemInfo, Uptime, Current};
 use nix::sys::{self, signal::{kill, Signal}};
 use nix::unistd::Pid as NixPid;
@@ -232,11 +232,15 @@ struct AppState {
     proc_tree: Vec<Rc<RefCell<TreeProc>>>, // contains the vector of processes with their children
     root_proc: Rc<RefCell<TreeProc>>, // gets the root process and its children
     curr_sel: u32, // gets the pid of the selected process
-    sel: bool, // used to identify which process is selected for killing
-    scroll_offset: usize,
     thread_process_pid: Pid, // stores the process whose thread data is being displayed 
     thread_samples: HashMap<i32,ThreadSample>,
     latest_thread_count: usize,
+    renice_prompt: bool,
+    renice_input: String,
+    renice_error: Option<String>,
+    sel: bool, // used to identify which process is selected for killing
+    scroll_offset: usize,
+
 }
 
 impl AppState {
@@ -274,6 +278,9 @@ impl AppState {
             thread_process_pid: Pid::from(1),
             thread_samples: HashMap::new(),
             latest_thread_count: 1,
+            renice_prompt: false,
+            renice_input: String::new(),
+            renice_error: None,
         }
     }
 
@@ -458,16 +465,40 @@ fn selected_pid(state: &AppState) -> Pid{
     sysinfo::Pid::from(1)
 }
 
+
+fn renice_process(pid: Pid, new_nice: i32) -> Result<(), nix::Error> {
+ 
+    let result = unsafe {
+ 
+        libc::setpriority(
+ 
+            libc::PRIO_PROCESS,
+            pid.as_u32() as libc::id_t,
+            new_nice as libc::c_int,
+
+        )
+    };
+ 
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(Errno::last().into())
+    }
+}
+ 
+
+
 fn help_panel<'a>() -> Paragraph<'a> {
     let left_text = vec![
         Line::from(Span::styled(
             "Process Management:",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )),
-        Line::from("  K: Kill (SIGTERM)"),
-        Line::from("  U: Force Kill (SIGKILL)"),
+        Line::from("  K: Kill"),
+        Line::from("  U: Force Kill"),
         Line::from("  S: Suspend"),
         Line::from("  R: Resume"),
+        Line::from("  N: Renice Process"),
         Line::from(""),
         Line::from(Span::styled(
             "Navigation:",
@@ -680,6 +711,22 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
                 // top and htop display raw cpu so using that
                 let normalized_cpu = proc.cpu_usage() / cpu_count;
 
+                let cpu_time_ms = proc.accumulated_cpu_time();
+
+                let cpu_time_str = ms_to_human(cpu_time_ms);
+ 
+                let prio = procfs::process::Process::new(pid.as_u32() as i32)
+                    .and_then(|p| p.stat())
+                    .map(|stat| stat.priority)
+                    .unwrap_or_default();
+
+                let disk_usage = proc.disk_usage();
+                let disk_read_str = bytes_to_human(disk_usage.total_read_bytes);
+                let disk_write_str = bytes_to_human(disk_usage.total_written_bytes);
+                let thread_count = std::fs::read_dir(format!("/proc/{}/task", pid.as_u32()))
+                    .map(|dir| dir.count())
+                    .unwrap_or(0);
+
                 // Check if the process is marked as killed
                 let status = if state.killed_pids.contains(pid) {
                     "Killed".to_string()
@@ -700,9 +747,14 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
                     pid.to_string(),
                     proc.name().to_string_lossy().to_string(),
                     unsafe { getpriority(PRIO_PROCESS, pid.as_u32()) }.to_string(),
+                    prio.to_string(),
                     status,  // Display custom status here
                     format!("{:.2}%", proc.cpu_usage()),
                     format!("{:.2}%", (proc.memory() as f64 / total_mem) * 100.0 ),
+                    cpu_time_str,                  
+                    disk_read_str,
+                    disk_write_str,
+                    thread_count.to_string(), 
                 ]).style(style)
             })
         })
@@ -727,17 +779,27 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
         Constraint::Length(8),       // PID column width
         Constraint::Percentage(30),  // Process name column width
         Constraint::Length(5),       // Nice values column width 
+        Constraint::Length(10),       // Priority column width
         Constraint::Length(10),      // State column width
         Constraint::Length(12),      // CPU usage column width
         Constraint::Length(15),      // Memory usage column width
+        Constraint::Length(10),      
+        Constraint::Length(14),
+        Constraint::Length(14),
+        Constraint::Length(8),
     ])
     .header(Row::new(vec![
         "PID".to_string(),
         "Process Name".to_string(),
         "NI".to_string(),
+        "Priority".to_string(),
         "State".to_string(),       
         "CPU Usage".to_string(),
         "Memory Usage".to_string(),
+        "CPU Time".to_string(),
+        "Disk Read".to_string(),
+        "Disk Write".to_string(),
+        "Threads".to_string(),
     ]).style(Style::default().add_modifier(Modifier::BOLD)))
     .block(Block::default().title(format!(
         "Processes [{}] [Sort: {}{}]{}",
@@ -808,6 +870,12 @@ fn get_overall_process_data<'a>(sys: &'a sysinfo::System, app: &'a mut AppState)
 }
 
 
+fn ms_to_human(ms: u64) -> String {
+    let secs = ms / 1000;
+    let mins = secs / 60;
+    let hours = mins / 60;
+    format!("{:02}:{:02}:{:02}", hours, mins % 60, secs % 60)
+}
 
 fn get_thread_info(state: & mut AppState) -> ProcResult<Vec<ThreadInfo>> {
     
@@ -1423,7 +1491,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
 
     // Background
     let background = Block::default()
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(Color::Rgb(101, 40, 80)));
     frame.render_widget(background, area);
 
     // If tree mode is enabled, draw tree and return early
@@ -1530,6 +1598,23 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         frame.render_widget(thread_info_to_table(state), per_thread);
         
     }
+}
+
+
+ 
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+ 
+
+    Rect {
+
+        x: (area.width - width) / 2,
+        y: (area.height - height) / 2,
+        width,
+        height,
+    }
+ 
+
 }
 
 // Extension for colors to create darker/lighter variants
