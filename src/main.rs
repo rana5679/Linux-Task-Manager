@@ -20,7 +20,7 @@ use std::path::Path;
 use procfs::{process::Process, ProcResult, WithCurrentSystemInfo, Uptime, Current};
 use nix::sys::{self, signal::{kill, Signal}};
 use nix::unistd::Pid as NixPid;
-use libc::{getpriority, PRIO_PROCESS};
+use libc::{getpriority, PRIO_PROCESS, pid_t, c_int, syscall, SYS_tgkill};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -173,7 +173,7 @@ enum Mode {
     Thread,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ThreadInfo {
     tid: u32,
     name: String,
@@ -199,11 +199,12 @@ struct AppState {
     thread_sort_mode: SortMode,
     frozen: bool,
     cached_pids: Option<Vec<Pid>>,
+    cached_threads: Option<Vec<ThreadInfo>>,
     proc_selected_index: usize,  // Added for process selection
     thread_selected_index: usize,
     show_help: bool,        // Added for help panel toggle
     killed_pids: Vec<Pid>, // Track killed processes
-    g1_data: Vec<(f64, f64)>, // track data points for graph 1
+    cpu_graph: Vec<(f64, f64)>, // track data points for graph 1
     memory_data: Vec<(f64, f64)>,    // Memory usage over time
     swap_data: Vec<(f64, f64)>,      // Swap usage over time
     disk_data: Vec<(f64, f64)>,      // Disk usage over time
@@ -233,11 +234,12 @@ impl AppState {
             thread_sort_mode: SortMode::Cpu,
             frozen: false,
             cached_pids: None,
+            cached_threads: None,
             proc_selected_index: 0,
             thread_selected_index: 0,
             show_help: false,
             killed_pids: Vec::new(),
-            g1_data: Vec::new(),
+            cpu_graph: Vec::new(),
             memory_data: Vec::new(),
             swap_data: Vec::new(),
             disk_data: Vec::new(),
@@ -298,10 +300,11 @@ impl AppState {
             Mode::Proc => {
                 self.proc_sort_mode = sortmode;
             // Reset cached processes when changing sort mode
-            self.cached_pids = None;
+                self.cached_pids = None;
             }
             Mode::Thread => {
                 self.thread_sort_mode = sortmode;
+                self.cached_threads = None;
             }
         }
     }
@@ -388,6 +391,32 @@ fn send_signal_to_selected_process(
     } else {
         Err(nix::Error::ESRCH)
     }
+}
+
+fn send_thread_signal( state: &mut AppState, signal: c_int) -> Result<(), nix::Error>  {
+
+    if let Some(threads) = &state.cached_threads {
+        if state.thread_scroll_position + state.thread_selected_index < state.latest_thread_count {
+            let index = state.thread_scroll_position + state.thread_selected_index;
+            let thread = &threads[index];
+
+            let tgid = state.thread_process_pid;
+            let result = unsafe { syscall(SYS_tgkill, tgid, thread.tid, signal) };
+
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(nix::Error::ESRCH)
+            }
+        } else {
+            Err(nix::Error::ESRCH)
+            }
+    } else {
+        Err(nix::Error::ESRCH)
+    }
+
+    
+   
 }
 
 // to get the selected process to display its threads
@@ -802,20 +831,33 @@ fn thread_info_to_table<'a>(state: &'a mut AppState) -> Table<'a>{
     // Convert clock ticks to seconds (Linux default is 100 ticks/sec)
   
 
-    let mut threads = get_thread_info(state).unwrap_or_default();
+    let threads = if state.frozen && state.cached_threads.is_some() {
+        // used cached threads if frozen
+        state.cached_threads.as_ref().unwrap().clone()
+    } else{ 
+        let mut threads = get_thread_info(state).unwrap_or_default();
 
-    // Sort based on selected sort mode
-    match state.thread_sort_mode {
-        SortMode::Cpu => {
-            threads.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
-        },
-        SortMode::Pid => {
-            threads.sort_by(|a, b| a.tid.cmp(&b.tid));
+        // Sort based on selected sort mode
+        match state.thread_sort_mode {
+            SortMode::Cpu => {
+                threads.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+            },
+            SortMode::Pid => {
+                threads.sort_by(|a, b| a.tid.cmp(&b.tid));
+            }
+            SortMode::Memory => {
+                threads.sort_by(|a, b| a.priority.cmp(&b.priority));
+            }
         }
-        SortMode::Memory => {
-            threads.sort_by(|a, b| a.priority.cmp(&b.priority));
+
+        // Cache the sorted list if not frozen
+        if !state.frozen || state.cached_threads.is_none() {
+            state.cached_threads = Some(threads.clone());
         }
-    }
+    
+        threads
+
+        };
 
     let sort_mode = match state.thread_sort_mode {
         SortMode::Cpu => "CPU",
@@ -911,20 +953,20 @@ fn calculate_x_bounds(data: &Vec<(f64, f64)>, x_ticks: usize)-> (f64, f64) {
 // fn cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect) ->canvas::Canvas<'a, impl Fn(&mut canvas::Context) + 'a>{
 
 //     // preparing the new point
-//     let new_x = app.g1_data.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
+//     let new_x = app.cpu_graph.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
 //     let new_y = sys.global_cpu_usage() as f64;
-//     app.g1_data.push((new_x, new_y));
+//     app.cpu_graph.push((new_x, new_y));
 
 //     let width = area.width; let height = area.height;
     
 //     let x_ticks = calculate_graph_x_ticks(width);
 
-//     let x_bounds = calculate_x_bounds(&app.g1_data, x_ticks);
+//     let x_bounds = calculate_x_bounds(&app.cpu_graph, x_ticks);
 
 //     let x_bounds = [x_bounds.0, x_bounds.1];
 
 
-//     let data = &app.g1_data;
+//     let data = &app.cpu_graph;
 
 
 //     canvas::Canvas::default()
@@ -950,26 +992,26 @@ fn calculate_x_bounds(data: &Vec<(f64, f64)>, x_ticks: usize)-> (f64, f64) {
 
 fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect) ->Chart<'a>{
     
-    let new_x = app.g1_data.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
+    let new_x = app.cpu_graph.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
     let new_y = sys.global_cpu_usage() as f64;
 
-    app.g1_data.push((new_x, new_y));
+    app.cpu_graph.push((new_x, new_y));
 
     let width = area.width;
     
     let x_ticks = calculate_graph_x_ticks(width);
 
-    let x_bounds = calculate_x_bounds(&app.g1_data, x_ticks);
+    let x_bounds = calculate_x_bounds(&app.cpu_graph, x_ticks);
 
     let x_bounds = [x_bounds.0, x_bounds.1];
 
-    if app.g1_data.len() > x_ticks{
-        app.g1_data.remove(0);
+    if app.cpu_graph.len() > x_ticks{
+        app.cpu_graph.remove(0);
     }
 
 
     let dataset = Dataset::default()
-    .data(&app.g1_data)
+    .data(&app.cpu_graph)
     .graph_type(GraphType::Bar)
     .marker(symbols::Marker::Braille)
     .style(Style::default().fg(Color::Rgb(120, 200, 120)).bg(Color::Black));
@@ -990,7 +1032,8 @@ fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect
             Block::default()
                 .borders(Borders::ALL)
                 .title("CPU %")
-                .style(Style::default().bg(Color::Black)))
+                )
+        .style(Style::default().bg(Color::Black))
 
 }
 struct MemoryGauges<'a> {
@@ -1258,7 +1301,7 @@ impl<'a> Widget for DiskGauges<'a> {
             // Title line with total size
             Paragraph::new(format!("root {:.0} GiB", total))
                 .style(Style::default().fg(Color::White))
-                .render(Rect::new(inner.x, y_offset + 1, inner.width, 1), buf);;
+                .render(Rect::new(inner.x, y_offset + 1, inner.width, 1), buf);
             
             // Used line
             Paragraph::new(format!("Used: {:.0}%", used_percent))
@@ -1575,23 +1618,46 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                     // Process management
                     KeyCode::Char('h') => state.toggle_help(),
                     KeyCode::Char('k') => {
-                        if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGTERM) {
-                            eprintln!("Error sending SIGTERM: {}", e);
+                        if state.mode == Mode::Proc {
+                            if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGTERM) {
+                                eprintln!("Error sending SIGTERM: {}", e);
+                            }
                         }
                     },
                     KeyCode::Char('u') => {
-                        if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGKILL) {
-                            eprintln!("Error sending SIGKILL: {}", e);
+                        if state.mode == Mode::Proc {
+                            if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGKILL) {
+                                eprintln!("Error sending SIGKILL: {}", e);
+                            }
+                        }
+                        else{
+                            if let Err(e) = send_thread_signal(& mut state, libc::SIGKILL) {
+                                eprintln!("Error sending SIGKILL: {}", e);
+                            }
                         }
                     },                    
                     KeyCode::Char('s') => {
-                        if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGSTOP) {
-                            eprintln!("Error sending SIGSTOP: {}", e);
+                        if state.mode == Mode::Proc {
+                            if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGSTOP) {
+                                eprintln!("Error sending SIGSTOP: {}", e);
+                            }
+                        }  
+                        else{
+                            if let Err(e) = send_thread_signal(& mut state, libc::SIGSTOP) {
+                                eprintln!("Error sending SIGSTOP: {}", e);
+                            }
                         }
                     },
                     KeyCode::Char('r') => {
-                        if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGCONT) {
-                            eprintln!("Error sending SIGCONT: {}", e);
+                        if state.mode == Mode::Proc {
+                            if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGCONT) {
+                                eprintln!("Error sending SIGCONT: {}", e);
+                            }
+                        }
+                        else{
+                            if let Err(e) = send_thread_signal(& mut state, libc::SIGCONT) {
+                                eprintln!("Error sending SIGCONT: {}", e);
+                            }
                         }
                     },
                     
@@ -1605,6 +1671,7 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                             state.thread_process_pid = pt_pid;
                             state.thread_scroll_position = 0;
                             state.thread_selected_index = 0;
+                            state.cached_threads = None;
                         }
                     },
                     _ => {}
