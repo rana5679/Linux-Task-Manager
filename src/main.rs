@@ -273,14 +273,14 @@ impl AppState {
             proc_tree,
             root_proc,
             curr_sel,
-            sel,
-            scroll_offset: 0,
             thread_process_pid: Pid::from(1),
             thread_samples: HashMap::new(),
             latest_thread_count: 1,
             renice_prompt: false,
             renice_input: String::new(),
             renice_error: None,
+            sel: false,
+            scroll_offset: 0,
         }
     }
 
@@ -570,8 +570,8 @@ fn system_info(sys: &sysinfo::System) -> Table {
 
 
     Table::new(rows,
-        &[ratatui::layout::Constraint::Percentage(50), 
-        ratatui::layout::Constraint::Percentage(50)])
+        &[ratatui::layout::Constraint::Percentage(15), 
+        ratatui::layout::Constraint::Percentage(85)])
         .block(
             Block::default()
                 .title(Span::styled(
@@ -618,12 +618,13 @@ fn usage_info(sys: &sysinfo::System) -> Table {
 
 fn cpu_info(sys: &sysinfo::System) -> Table{
 
-    let mut rows: Vec<Row> = sys.cpus().chunks(2).enumerate().map(|(chunk_idx, chunk)|{
+    let mut rows: Vec<Row> = sys.cpus().chunks(1).enumerate().map(|(chunk_idx, chunk)|{
         
         let mut cells = Vec::new();
 
         for(i, cpu) in chunk.iter().enumerate(){
-            let idx = chunk_idx * 2 + i;
+            //let idx = chunk_idx * 2 + i;
+            let idx = chunk_idx;
             cells.push(Cell::from(Span::raw(format!("CPU {}:", idx))));
             cells.push(Cell::from(Span::raw(format!("{:.2}%", cpu.cpu_usage()))));
         }
@@ -639,10 +640,10 @@ fn cpu_info(sys: &sysinfo::System) -> Table{
 
     // go back to see dimensions
     Table::new(rows,
-        &[ratatui::layout::Constraint::Percentage(20), 
-        ratatui::layout::Constraint::Percentage(30),
-        ratatui::layout::Constraint::Percentage(20),
-        ratatui::layout::Constraint::Percentage(30)
+        &[ratatui::layout::Constraint::Percentage(40), 
+        ratatui::layout::Constraint::Percentage(60),
+        //ratatui::layout::Constraint::Percentage(20),
+        //ratatui::layout::Constraint::Percentage(30)
         ])
         .block(
             Block::default()
@@ -774,6 +775,10 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
     } else {
         " [H: Help]"  // Show minimal help when panel is hidden
     };
+
+    let header_style = Style::default()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD);
     
     Table::new(rows, [
         Constraint::Length(8),       // PID column width
@@ -800,7 +805,7 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
         "Disk Read".to_string(),
         "Disk Write".to_string(),
         "Threads".to_string(),
-    ]).style(Style::default().add_modifier(Modifier::BOLD)))
+    ]).style(header_style.add_modifier(Modifier::BOLD)))
     .block(Block::default().title(format!(
         "Processes [{}] [Sort: {}{}]{}",
         total,
@@ -1107,7 +1112,7 @@ fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect
     .data(&app.cpu_graph)
     .graph_type(GraphType::Bar)
     .marker(symbols::Marker::Braille)
-    .style(Style::default().fg(Color::Rgb(120, 200, 120)).bg(Color::Black));
+    .style(Style::default().fg(Color::Rgb(255, 215, 0)).bg(Color::Rgb(100, 75, 100)));
 
     // Configure axes
     let x_axis = Axis::default()
@@ -1125,7 +1130,7 @@ fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect
             Block::default()
                 .borders(Borders::ALL)
                 .title("CPU %"))
-        .style(Style::default().bg(Color::Black))
+        .style(Style::default().bg(BACKGROUND))
 
 }
 struct MemoryGauges<'a> {
@@ -1195,16 +1200,16 @@ impl<'a> MemoryGauges<'a> {
             block: Block::default()
                 .title("mem")
                 .borders(Borders::ALL)
-                .style(Style::default().bg(Color::Black)),
+                .style(Style::default().bg(Color::Rgb(3, 25, 35))),
         }
     }
 }
 // btop-like colors
-const MEM_USED_COLOR: Color = Color::Rgb(220, 70, 70);       // Red
-const MEM_AVAILABLE_COLOR: Color = Color::Rgb(220, 220, 70);  // Yellow
-const MEM_CACHED_COLOR: Color = Color::Rgb(70, 70, 220);      // Blue
-const MEM_FREE_COLOR: Color = Color::Rgb(70, 220, 70);        // Green
-const DISK_IO_COLOR: Color = Color::Rgb(220, 200, 80);        // Yellow
+const MEM_USED_COLOR: Color = Color::Rgb(250, 175, 200);       // Red
+const MEM_AVAILABLE_COLOR: Color = Color::Rgb(224, 176, 255);  // Yellow
+const MEM_CACHED_COLOR: Color = Color::Rgb(218, 112, 214);      // Blue
+const MEM_FREE_COLOR: Color = Color::Rgb(153, 85, 187);        // Green
+const BACKGROUND: Color = Color::Rgb(8, 25, 35);        // Yellow
 const DISK_USED_COLOR: Color = Color::Rgb(220, 70, 70);       // Red
 const DISK_FREE_COLOR: Color = Color::Rgb(70, 200, 70);       // Green
 
@@ -1305,7 +1310,7 @@ impl<'a> DiskGauges<'a> {
                 .title("disks")
                 // .border_style(Color::Rgb((20), (30), (40)))
                 .borders(Borders::ALL)
-                .style(Style::default().bg(Color::Black)),
+                .style(Style::default().bg(BACKGROUND)),
         }
     }
 }
@@ -1491,7 +1496,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
 
     // Background
     let background = Block::default()
-        .style(Style::default().bg(Color::Rgb(101, 40, 80)));
+        .style(Style::default().bg(BACKGROUND));
     frame.render_widget(background, area);
 
     // If tree mode is enabled, draw tree and return early
@@ -1510,7 +1515,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         let tree_text = Text::from(visible_lines.to_vec());
         let tree_widget = Paragraph::new(tree_text)
             .block(Block::default().title("Process Tree").borders(Borders::ALL))
-            .style(Style::default().bg(Color::Black));
+            .style(Style::default().bg(BACKGROUND));
         frame.render_widget(tree_widget, area);
         return;
     }
@@ -1547,8 +1552,8 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         
         let [top, middle, bottom] = Layout::vertical([
             Constraint::Fill(1),
-            Constraint::Fill(2),
-            Constraint::Fill(2)
+            Constraint::Fill(3),
+            Constraint::Fill(3)
         ]).areas(area);
 
         let [systeminfo, useageinfo] = Layout::horizontal([
@@ -1562,7 +1567,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         ]).areas(middle);
 
         let [cpus, cpu_graph] = Layout::horizontal([
-            Constraint::Fill(2),
+            Constraint::Fill(1),
             Constraint::Fill(3)
         ]).areas(cpu);
 
@@ -1572,7 +1577,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         ]).areas(mem_disk);
 
         let [process, thread] = Layout::horizontal([
-            Constraint::Fill(1),
+            Constraint::Fill(2),
             Constraint::Fill(1)
         ]).areas(bottom);
 
