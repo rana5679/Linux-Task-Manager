@@ -17,6 +17,7 @@ use ratatui::{
     Terminal,
 };
 use std::path::Path;
+
 use procfs::{process::Process, ProcResult, WithCurrentSystemInfo, Uptime, Current};
 use nix::sys::{self, signal::{kill, Signal}};
 use nix::unistd::Pid as NixPid;
@@ -211,9 +212,11 @@ struct AppState {
     proc_tree: Vec<Rc<RefCell<TreeProc>>>, // contains the vector of processes with their children
     root_proc: Rc<RefCell<TreeProc>>, // gets the root process and its children
     curr_sel: u32, // gets the pid of the selected process
+
     thread_process_pid: Pid, // stores the process whose thread data is being displayed 
     thread_samples: HashMap<i32,ThreadSample>,
     latest_thread_count: usize,
+
 }
 
 impl AppState {
@@ -249,6 +252,7 @@ impl AppState {
             thread_process_pid: Pid::from(1),
             thread_samples: HashMap::new(),
             latest_thread_count: 1,
+
         }
     }
 
@@ -1031,8 +1035,7 @@ fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("CPU %")
-                )
+                .title("CPU %"))
         .style(Style::default().bg(Color::Black))
 
 }
@@ -1301,7 +1304,7 @@ impl<'a> Widget for DiskGauges<'a> {
             // Title line with total size
             Paragraph::new(format!("root {:.0} GiB", total))
                 .style(Style::default().fg(Color::White))
-                .render(Rect::new(inner.x, y_offset + 1, inner.width, 1), buf);
+                .render(Rect::new(inner.x, y_offset + 1, inner.width, 1), buf);;
             
             // Used line
             Paragraph::new(format!("Used: {:.0}%", used_percent))
@@ -1479,12 +1482,12 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
             Constraint::Fill(4)
         ]).areas(thread);
 
+
         let process_section_height = (process.height as f32).floor() as u16;
         state.proc_show_count = ((process_section_height.saturating_sub(3)) as f64) as usize;
 
         let thread_section_height = (per_thread.height as f32).floor() as u16;
         state.thread_show_count = ((thread_section_height.saturating_sub(3)) as f64) as usize;
-
         frame.render_widget(system_info(&sys), top);
         // frame.render_widget(usage_info(&sys), useageinfo);
         frame.render_widget(cpu_info(&sys), cpus);
@@ -1544,7 +1547,9 @@ fn main() -> io::Result<()> {
    let root_index = find_root(&processes_tree).unwrap();
    let root_proc = Rc::clone(&processes_tree[root_index]); 
 
+
 let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), root_proc.borrow().get_pid());
+
     
     let mut tree:bool = false;
     let mut i = 0; // index into the  tree stack
@@ -1606,6 +1611,7 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                             state.select_previous()
                         }
                     },
+
                     KeyCode::Right => 
                     {
                         state.mode = Mode::Thread;
