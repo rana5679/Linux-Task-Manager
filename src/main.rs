@@ -28,20 +28,29 @@ use std::time::{Duration, Instant};
 #[derive(Eq, PartialEq)]
 // struct representing each process and its information
 struct TreeProc {
+    name: String,
     pid: u32,
     ppid: u32,
     displayed: bool,
     children: Vec<Rc<RefCell<TreeProc>>>,
+    selected: bool,
 }
 
 impl TreeProc {
-    fn new(pid: u32, ppid: u32) -> Rc<RefCell<Self>> {
+    fn new(name: String, pid: u32, ppid: u32) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(TreeProc {
+            name,
             pid,
             ppid,
             displayed: false,
             children: Vec::new(),
+            selected: false,
         }))
+    }
+    
+    // gets the name of the process
+    fn get_name(&self) -> String {
+        self.name.clone()
     }
 
     // adds a child to the children 
@@ -68,6 +77,16 @@ impl TreeProc {
     fn get_numchildren(&self) -> usize {
         self.children.len()
     }
+    
+    // setter for selected
+    fn set_selected(&mut self, val: bool){
+        self.selected = val;
+    }
+    
+    // getter for selected
+    fn get_selected(&self) -> bool {
+        self.selected
+    }
 }
 
 // creates a vector of Treeprocs and fills the in the information about each process
@@ -81,7 +100,7 @@ fn Tree_create() -> Vec<Rc<RefCell<TreeProc>>> {
     // fills the pid and ppid for each process
     for (pid, process) in system.processes() {
         let parent_pid = process.parent().unwrap_or(0.into());
-        let curr_proc = TreeProc::new(pid.as_u32(), parent_pid.as_u32());
+        let curr_proc = TreeProc::new(process.name().to_string_lossy().into_owned(),pid.as_u32(), parent_pid.as_u32());
         processes_running.push(curr_proc);
     }
 
@@ -113,16 +132,17 @@ fn Tree_display(
     process_arr: Vec<Rc<RefCell<TreeProc>>>,  // Take ownership of the vector
     indent: usize,
     current: u32,
-) -> Text<'static> {
+    sel: bool,
+) -> Vec<Line<'static>> {
     let mut tree_levels = Vec::new();
 
     // creates a line for each process
     for proc in process_arr {  
         let curr_proc = proc.borrow();
-        let prefix = "   ".repeat(indent);
+        let prefix = "  ".repeat(indent);
 
         // checks which process line is selected and highlights it
-        let line = if current == curr_proc.get_pid() {
+        let line = if current == curr_proc.get_pid() || curr_proc.get_selected() == true{
             Line::from(vec![
                 Span::raw(prefix.clone()),
                 Span::styled(
@@ -135,7 +155,7 @@ fn Tree_display(
         } 
         // if not selected then it does not get highlighted
         else {
-            Line::from(vec![Span::raw(format!("{} -->  {}", prefix, curr_proc.get_pid()))])
+            Line::from(vec![Span::raw(format!("{} -->  ({}) {}", prefix,curr_proc.get_name(), curr_proc.get_pid()))])
         };
 
         tree_levels.push(line);
@@ -143,11 +163,11 @@ fn Tree_display(
         
         let children = curr_proc.get_children();
         // recursively calls the function to display all the processes
-        let children_text = Tree_display(children, indent + 1, current);
-        tree_levels.extend(children_text.lines);
+        let children_text = Tree_display(children, indent + 1, current,sel);
+        tree_levels.extend(children_text);
     }
 
-    Text::from(tree_levels)
+    tree_levels
 }
 
 // does depth first search on each process and returns a vector of that order
@@ -216,12 +236,10 @@ struct AppState {
     thread_samples: HashMap<i32,ThreadSample>,
     latest_thread_count: usize,
     renice_prompt: bool,
- 
-
     renice_input: String,
- 
-
     renice_error: Option<String>,
+    sel: bool, // used to identify which process is selected for killing
+    scroll_offset: usize,
 
 }
 
@@ -255,13 +273,14 @@ impl AppState {
             proc_tree,
             root_proc,
             curr_sel,
+            sel,
+            scroll_offset: 0,
             thread_process_pid: Pid::from(1),
             thread_samples: HashMap::new(),
             latest_thread_count: 1,
             renice_prompt: false,
             renice_input: String::new(),
             renice_error: None,
-
         }
     }
 
@@ -1477,8 +1496,18 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
 
     // If tree mode is enabled, draw tree and return early
     if tree {
-        let tree_proc = vec![Rc::clone(&state.root_proc)];
-        let tree_text = Tree_display(tree_proc, 0, state.curr_sel);
+       let tree_proc = vec![Rc::clone(&state.root_proc)];
+        //let tree_text = Tree_display(tree_proc, 0, state.curr_sel,state.sel);
+        let all_lines = Tree_display(tree_proc, 0, state.curr_sel,state.sel);
+        let area_height = area.height.saturating_sub(2) as usize; // account for border
+        let total_lines = all_lines.len();
+
+        // Clamp scroll_offset
+        state.scroll_offset = state.scroll_offset.min(total_lines.saturating_sub(area_height));
+
+        // Get visible lines based on scroll offset
+        let visible_lines = &all_lines[state.scroll_offset..(state.scroll_offset + area_height).min(total_lines)];
+        let tree_text = Text::from(visible_lines.to_vec());
         let tree_widget = Paragraph::new(tree_text)
             .block(Block::default().title("Process Tree").borders(Borders::ALL))
             .style(Style::default().bg(Color::Black));
@@ -1669,6 +1698,24 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                     KeyCode::Char('m') => state.change_sort_mode(SortMode::Memory),
                     KeyCode::Char('p') => state.change_sort_mode(SortMode::Pid),
                     
+                     KeyCode::Left => {
+                        if tree{
+                            state.scroll_offset += 1;
+                        }
+                        else{
+                          state.mode = Mode::Proc;
+                        }
+                    },
+                    
+                    KeyCode::Right => {
+                        if tree{
+                            state.scroll_offset = state.scroll_offset.saturating_sub(1);
+                        }
+                       else {
+                         state.mode = Mode::Thread;
+                       }
+                    },
+                    
                     // Selection navigation
                     KeyCode::Down => {
                         if tree{
@@ -1698,24 +1745,27 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                             state.select_previous()
                         }
                     },
-
-                    KeyCode::Right => 
-                    {
-                        state.mode = Mode::Thread;
-                    },
-                    KeyCode::Left => state.mode = Mode::Proc,
-
+                  
                     KeyCode::PageDown => state.page_down(total_processes),
                     KeyCode::PageUp => state.page_up(),
                     
                     // Process management
                     KeyCode::Char('h') => state.toggle_help(),
                     KeyCode::Char('k') => {
-                        if state.mode == Mode::Proc {
-                            if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGTERM) {
-                                eprintln!("Error sending SIGTERM: {}", e);
+                        if tree{
+                            for proc in &stack {
+                                if proc.borrow().get_selected() == true{
+                                    if let Err(e) = kill(NixPid::from_raw(proc.borrow().get_pid() as i32), Signal::SIGTERM) {
+                                        eprintln!("Failed to kill PID {}: {}", proc.borrow().get_pid(), e);
+                                    }
+                                }
                             }
                         }
+                        else{
+                            if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGTERM) {
+                            eprintln!("Error sending SIGTERM: {}", e);
+                        }
+                      }
                     },
                     KeyCode::Char('u') => {
                         if state.mode == Mode::Proc {
@@ -1729,18 +1779,27 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                             }
                         }
                     },                    
-                    KeyCode::Char('s') => {
-                        if state.mode == Mode::Proc {
-                            if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGSTOP) {
-                                eprintln!("Error sending SIGSTOP: {}", e);
+                      KeyCode::Char('s') => {
+                        if tree{
+                            if let Some(proc) = stack.get(i) {
+                                proc.borrow_mut().set_selected(true);
                             }
-                        }  
+                        }
                         else{
-                            if let Err(e) = send_thread_signal(& mut state, libc::SIGSTOP) {
-                                eprintln!("Error sending SIGSTOP: {}", e);
+                            if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGSTOP) {
+                            eprintln!("Error sending SIGSTOP: {}", e);
                             }
                         }
                     },
+                    
+                    KeyCode::Char('d') => {
+                        if tree{
+                            if let Some(proc) = stack.get(i) {
+                                proc.borrow_mut().set_selected(false);
+                            }
+                        }
+                    },
+                    
                     KeyCode::Char('r') => {
                         if state.mode == Mode::Proc {
                             if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGCONT) {
