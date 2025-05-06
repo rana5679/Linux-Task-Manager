@@ -13,6 +13,7 @@ libc = "0.2.171"
 sysinfo = { version = "0.34.2", features = ["disk"] }  # Add disk feature
 rand = "0.8.5"
 procfs = "0.17.0"
+chrono = {version = "0.4", features = ["clock"]}
 
 
 
