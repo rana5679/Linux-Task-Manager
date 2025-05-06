@@ -21,7 +21,7 @@ use nix::errno::Errno;
 use procfs::{process::Process, ProcResult, WithCurrentSystemInfo, Uptime, Current};
 use nix::sys::{self, signal::{kill, Signal}};
 use nix::unistd::Pid as NixPid;
-use libc::{getpriority, PRIO_PROCESS, pid_t, c_int, syscall, SYS_tgkill};
+use libc::{getpriority, PRIO_PROCESS, pid_t, c_int, syscall, SYS_tgkill,setpriority};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -466,23 +466,12 @@ fn selected_pid(state: &AppState) -> Pid{
 }
 
 
-fn renice_process(pid: Pid, new_nice: i32) -> Result<(), nix::Error> {
- 
-    let result = unsafe {
- 
-        libc::setpriority(
- 
-            libc::PRIO_PROCESS,
-            pid.as_u32() as libc::id_t,
-            new_nice as libc::c_int,
-
-        )
-    };
- 
-    if result == 0 {
+fn renice_process(pid: Pid, new_nice: i32) -> Result<(), String> {
+    let ret = unsafe { setpriority(PRIO_PROCESS, pid.as_u32(), new_nice) };
+    if ret == 0 {
         Ok(())
     } else {
-        Err(Errno::last().into())
+        Err(format!("Failed to renice PID {} to {}: {}", pid, new_nice, std::io::Error::last_os_error()))
     }
 }
  
@@ -1034,59 +1023,6 @@ fn calculate_x_bounds(data: &Vec<(f64, f64)>, x_ticks: usize)-> (f64, f64) {
 
     (x_start, x_end)
 }
-
-//  IGNORE this part but keep ot for now
-
-// fn value_to_color(value: f64, max: f64) -> Color{
-    
-//     let ratio = value/max;
-    
-//     Color::Rgb(
-//         (255.0 * ratio) as u8,       // Red component increases
-//         (255.0 * (1.0 - ratio)) as u8, // Blue component decreases
-//         100                            // Green fixed at 0
-//     )
-// }
-
-// fn cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect) ->canvas::Canvas<'a, impl Fn(&mut canvas::Context) + 'a>{
-
-//     // preparing the new point
-//     let new_x = app.cpu_graph.last().map(|(x, _)| x + 1.0).unwrap_or(0.0);
-//     let new_y = sys.global_cpu_usage() as f64;
-//     app.cpu_graph.push((new_x, new_y));
-
-//     let width = area.width; let height = area.height;
-    
-//     let x_ticks = calculate_graph_x_ticks(width);
-
-//     let x_bounds = calculate_x_bounds(&app.cpu_graph, x_ticks);
-
-//     let x_bounds = [x_bounds.0, x_bounds.1];
-
-
-//     let data = &app.cpu_graph;
-
-
-//     canvas::Canvas::default()
-//     .block(Block::bordered().title("CPU usage").style(Style::default().bg(Color::Black)))
-//     .x_bounds(x_bounds)
-//     .y_bounds([0.0, 100.0])
-//     .marker(symbols::Marker::Braille)
-//     .paint(|ctx: &mut canvas::Context|
-//     {
-//         for (i, &(x, y)) in data.iter().enumerate(){
-//             let color = value_to_color(y, 100.0);
-
-//             for y_pos in 0..(y as usize) {
-//                 ctx.print(
-//                     i as f64 + 0.5,
-//                     y_pos as f64 + 0.5,
-//                     "â£¿".fg(color)
-//                 );
-//             }
-//         }
-//     })
-// }
 
 fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect) ->Chart<'a>{
     
@@ -1667,6 +1603,7 @@ fn main() -> io::Result<()> {
    let processes_tree: Vec<Rc<RefCell<TreeProc>>> = Tree_create();
    let root_index = find_root(&processes_tree).unwrap();
    let root_proc = Rc::clone(&processes_tree[root_index]); 
+   let mut niceval;
 
 
 let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), root_proc.borrow().get_pid());
@@ -1817,6 +1754,26 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                             }
                         }
                     },
+                    
+                    KeyCode::Char('+') => {
+                        let temp_pid = selected_pid(&state).as_u32();
+                        niceval = unsafe { getpriority(PRIO_PROCESS,temp_pid) };
+                        if niceval < 19{
+                            niceval += 1;
+                        }
+                        
+                        renice_process(selected_pid(&state), niceval);
+                    }
+                    
+                     KeyCode::Char('-') => {
+                        let temp_pid = selected_pid(&state).as_u32();
+                        niceval = unsafe { getpriority(PRIO_PROCESS, temp_pid) };
+                        if niceval > -20{
+                        niceval =  niceval - 1;
+                        }
+                        
+                        renice_process(selected_pid(&state), niceval);
+                    }
                     
                     KeyCode::Char('t') if key.modifiers.is_empty() => {
                         tree = !tree;
