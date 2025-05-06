@@ -579,7 +579,7 @@ fn help_panel<'a>() -> Table<'a> {
                 "Tree Selection",
                 Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
             )),
-            Cell::from("F: Freeze Display"),
+            Cell::from("F: Freeze/Unfreeze Display"),
         ]),
         Row::new(vec![
             Cell::from("→ : Show Thread Data for Selected Process"),
