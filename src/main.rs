@@ -1817,10 +1817,17 @@ let mut state = AppState::new(15, 15, Rc::clone(&root_proc), root_proc.borrow().
                             }
                         }
                         else{
-                            if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGTERM) {
-                            eprintln!("Error sending SIGTERM: {}", e);
+                            if state.mode == Mode::Proc {
+                                if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGTERM) {
+                                    eprintln!("Error sending SIGTERM: {}", e);
+                                }
+                            }
+                            else{
+                                if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGTERM) {
+                                    eprintln!("Error sending SIGTERM: {}", e);
+                                }
+                            }
                         }
-                      }
                     },
                     KeyCode::Char('k') => {
                         if state.mode == Mode::Proc {
