@@ -1823,7 +1823,7 @@ let mut state = AppState::new(15, 15, Rc::clone(&root_proc), root_proc.borrow().
                                 }
                             }
                             else{
-                                if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGTERM) {
+                                if let Err(e) = send_thread_signal(& mut state, libc::SIGTERM) {
                                     eprintln!("Error sending SIGTERM: {}", e);
                                 }
                             }
@@ -1847,16 +1847,18 @@ let mut state = AppState::new(15, 15, Rc::clone(&root_proc), root_proc.borrow().
                                 proc.borrow_mut().set_selected(true);
                             }
                         }
-                        else{
+                    },
+                    KeyCode::Char('p') => {
+                            if state.mode == Mode::Proc{
                             if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGSTOP) {
                             eprintln!("Error sending SIGSTOP: {}", e);
                             }
                         }
-                    },
-                    KeyCode::Char('p') => {
-                            if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGSTOP) {
+                        else{
+                            if let Err(e) = send_thread_signal(& mut state, libc::SIGSTOP) {
                             eprintln!("Error sending SIGSTOP: {}", e);
                             }
+                        }
                     },
                     
                     KeyCode::Char('d') => {
