@@ -24,6 +24,7 @@ use nix::unistd::Pid as NixPid;
 use libc::{getpriority, PRIO_PROCESS, pid_t, c_int, syscall, SYS_tgkill,setpriority};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use chrono::{NaiveDateTime, Local, TimeZone};
 
 #[derive(Eq, PartialEq)]
 // struct representing each process and its information
@@ -487,7 +488,7 @@ fn help_panel<'a>() -> Paragraph<'a> {
         Line::from("  U: Force Kill"),
         Line::from("  S: Suspend"),
         Line::from("  R: Resume"),
-        Line::from("  N: Renice Process"),
+        Line::from("  Shift +: Renice Process"),
         Line::from(""),
         Line::from(Span::styled(
             "Navigation:",
@@ -534,6 +535,19 @@ fn help_panel<'a>() -> Paragraph<'a> {
         .wrap(Wrap { trim: true })
 }
 
+fn format_uptime(seconds: u64) -> String {
+    let days = seconds / 86400;
+    let hours = (seconds % 86400) / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+    if days > 0 {
+        format!("{}d {:02}h {:02}m {:02}s", days, hours, minutes, secs)
+    } else if hours > 0 {
+        format!("{:02}h {:02}m {:02}s", hours, minutes, secs)
+    } else {
+        format!("{:02}m {:02}s", minutes, secs)
+    }
+}
 
 fn system_info(sys: &sysinfo::System) -> Table {
     let sys_titles = vec![
@@ -541,14 +555,18 @@ fn system_info(sys: &sysinfo::System) -> Table {
     "System Kernel Version:",
     "System OS Version:",
     "System Host Name:",
+    "System Uptime:",
     "NB CPUs:",
     ];
+    let sys = System::new_all();
+
 
     let sys_values = vec![
         System::name().unwrap_or("Unknown".to_string()),
         System::kernel_version().unwrap_or("Unknown".to_string()),
         System::os_version().unwrap_or("Unknown".to_string()),
         System::host_name().unwrap_or("Unknown".to_string()),
+        format_uptime(System::uptime()),
         format!("{}", sys.cpus().len()),
     ];
 
@@ -699,7 +717,14 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
             sys.process(*pid).map(|proc| {
                 
                 // top and htop display raw cpu so using that
-                let normalized_cpu = proc.cpu_usage() / cpu_count;
+                // let normalized_cpu = proc.cpu_usage() / cpu_count;
+                
+                let start_time_epoch = proc.start_time(); // seconds since epoch
+                let start_time_str = Local.timestamp_opt(start_time_epoch as i64, 0)
+                    .single()
+                    .map(|dt| dt.format("%H:%M:%S").to_string())
+                    .unwrap_or_else(|| "-".to_string());
+
 
                 let cpu_time_ms = proc.accumulated_cpu_time();
 
@@ -741,6 +766,7 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
                     status,  // Display custom status here
                     format!("{:.2}%", proc.cpu_usage()),
                     format!("{:.2}%", (proc.memory() as f64 / total_mem) * 100.0 ),
+                    start_time_str,
                     cpu_time_str,                  
                     disk_read_str,
                     disk_write_str,
@@ -777,6 +803,7 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
         Constraint::Length(10),      // State column width
         Constraint::Length(12),      // CPU usage column width
         Constraint::Length(15),      // Memory usage column width
+        Constraint::Length(15),      // Start time column width
         Constraint::Length(10),      
         Constraint::Length(14),
         Constraint::Length(14),
@@ -790,6 +817,7 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
         "State".to_string(),       
         "CPU Usage".to_string(),
         "Memory Usage".to_string(),
+        "Start Time".to_string(),
         "CPU Time".to_string(),
         "Disk Read".to_string(),
         "Disk Write".to_string(),
@@ -1134,9 +1162,9 @@ impl<'a> MemoryGauges<'a> {
             cached_mem,
             free_mem,
             block: Block::default()
-                .title("mem")
+                .title("Mem")
                 .borders(Borders::ALL)
-                .style(Style::default().bg(Color::Rgb(3, 25, 35))),
+                .style(Style::default().add_modifier(Modifier::BOLD).bg(Color::Rgb(3, 25, 35))),
         }
     }
 }
@@ -1164,70 +1192,44 @@ impl<'a> Widget for MemoryGauges<'a> {
             .style(Style::default().fg(Color::White))
             .render(Rect::new(inner.x, inner.y, inner.width, 1), buf);
 
-        // Each metric takes 2 lines
-        let memory_y = [
-            inner.y + 1,  // Used
-            inner.y + 4,  // Available
-            inner.y + 7,  // Cached
-            inner.y + 10,  // Free
-        ];
+        // Each section takes 4 lines (title, value, gauge, space)
+        let row_height = 4;
         
-        render_memory_line(
-            Rect::new(inner.x, memory_y[0], inner.width, 2),
-            "Used:", 
-            used_percent, 
-            self.used_mem,
-            MEM_USED_COLOR,
-            buf,
-        );
-        render_memory_line(
-            Rect::new(inner.x, memory_y[1], inner.width, 2),
-            "Available:", 
-            available_percent, 
-            self.available_mem,
-            MEM_AVAILABLE_COLOR,
-            buf,
-        );
-        render_memory_line(
-            Rect::new(inner.x, memory_y[2], inner.width, 2),
-            "Cached:", 
-            cached_percent, 
-            self.cached_mem,
-            MEM_CACHED_COLOR,
-            buf,
-        );
-        render_memory_line(
-            Rect::new(inner.x, memory_y[3], inner.width, 2),
-            "Free:", 
-            free_percent, 
-            self.free_mem,
-            MEM_FREE_COLOR,
-            buf,
-        );
+        for (i, (label, percent, value, color)) in [
+            ("Used:", used_percent, self.used_mem, MEM_USED_COLOR),
+            ("Available:", available_percent, self.available_mem, MEM_AVAILABLE_COLOR),
+            ("Cached:", cached_percent, self.cached_mem, MEM_CACHED_COLOR),
+            ("Free:", free_percent, self.free_mem, MEM_FREE_COLOR),
+        ].iter().enumerate() {
+            let base_y = inner.y + 2 + (i as u16 * row_height);
+            
+            // Label on first line
+            Paragraph::new(*label)
+                .style(Style::default().fg(Color::White))
+                .render(Rect::new(inner.x, base_y, inner.width / 2, 1), buf);
+                
+            // Value on same line, right aligned
+            Paragraph::new(format!("{:.2} GiB", value))
+                .style(Style::default().fg(Color::White))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x + inner.width / 2, base_y, inner.width / 2, 1), buf);
+            
+            // Gauge on next line
+            render_braille_gauge(
+                Rect::new(inner.x, base_y + 1, inner.width - 6, 1),
+                *percent / 100.0,
+                *color,
+                buf,
+            );
+            
+            // Percentage next to gauge
+            Paragraph::new(format!("{:>3.0}%", percent))
+                .style(Style::default().fg(*color))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x + inner.width - 6, base_y + 1, 6, 1), buf);
+        }
     }
 }
-
-
-fn render_memory_line(area: Rect, label: &str, percent: f64, value: f64, color: Color, buf: &mut Buffer) {
-    // First line: label left, value right
-    Paragraph::new(format!("{:<9}{:>8.2} GiB", label, value))
-        .style(Style::default().fg(color))
-        .render(Rect::new(area.x, area.y, area.width, 1), buf);
-
-    // Second line: graph left, percent right
-    let bar_width = area.width.saturating_sub(6);
-    render_braille_gauge(
-        Rect::new(area.x, area.y + 1, bar_width, 1),
-        percent / 100.0,
-        color,
-        buf,
-    );
-    Paragraph::new(format!("{:>3.0}%", percent))
-        .style(Style::default().fg(color))
-        .alignment(Alignment::Right)
-        .render(Rect::new(area.x + bar_width, area.y + 1, 6, 1), buf);
-}
-
 
 fn memory_gauges<'a>(sys: &sysinfo::System) -> MemoryGauges {
     MemoryGauges::new(sys)
@@ -1243,10 +1245,10 @@ impl<'a> DiskGauges<'a> {
         Self {
             sys,
             block: Block::default()
-                .title("disks")
+                .title("Disks")
                 // .border_style(Color::Rgb((20), (30), (40)))
                 .borders(Borders::ALL)
-                .style(Style::default().bg(BACKGROUND)),
+                .style(Style::default().add_modifier(Modifier::BOLD).bg(BACKGROUND)),
         }
     }
 }
@@ -1316,8 +1318,8 @@ impl<'a> Widget for DiskGauges<'a> {
         let inner = self.block.inner(rect);
         self.block.render(rect, buf);
         
-        // Spacing constants for each disk entry
-        const DISK_ENTRY_HEIGHT: u16 = 4; // Title + IO% + Used + Free
+        // Spacing constants for each disk entry (reduced from 4 to 3)
+        const DISK_ENTRY_HEIGHT: u16 = 3; // Title + Used + Free
         
         // Calculate how many disks we show
         let disks = sysinfo::Disks::new_with_refreshed_list();
@@ -1332,45 +1334,61 @@ impl<'a> Widget for DiskGauges<'a> {
             let free_percent = 100.0 - used_percent;
             
             // Title line with total size
-            Paragraph::new(format!("root {:.0} GiB", total))
+            Paragraph::new(Line::from(vec![
+                Span::styled("root: ", Style::default().fg(Color::White)),
+                Span::styled(format!("{:.0} GiB", total), Style::default().fg(Color::White)),
+            ]))
+            .render(Rect::new(inner.x, y_offset, inner.width, 1), buf);
+            
+            // Used line (label and value on one line)
+            Paragraph::new("Used:")
                 .style(Style::default().fg(Color::White))
-                .render(Rect::new(inner.x, y_offset + 1, inner.width, 1), buf);;
-            
-            // Used line
-            Paragraph::new(format!("Used: {:.0}%", used_percent))
-            .style(Style::default().fg(MEM_USED_COLOR))
-            .render(Rect::new(inner.x, y_offset + 2, 10, 1), buf);
-            
+                .render(Rect::new(inner.x, y_offset + 1, inner.width / 2, 1), buf);
+                
+            Paragraph::new(format!("{:.1} GiB", used))
+                .style(Style::default().fg(Color::White))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x + inner.width / 2, y_offset + 1, inner.width / 2, 1), buf);
+                
+            // Used gauge (gauge and percentage on next line)
             render_braille_gauge(
-                Rect::new(inner.x + 10, y_offset + 2, inner.width.saturating_sub(20), 1),
+                Rect::new(inner.x, y_offset + 2, inner.width - 6, 1),
                 used_percent / 100.0,
                 MEM_USED_COLOR,
                 buf
             );
             
-            Paragraph::new(format!("{:.1} GiB", used))
-                .style(Style::default().fg(Color::Gray))
+            Paragraph::new(format!("{:>3.0}%", used_percent))
+                .style(Style::default().fg(MEM_USED_COLOR))
                 .alignment(Alignment::Right)
-                .render(Rect::new(inner.x + inner.width.saturating_sub(10), y_offset + 2, 10, 1), buf);
+                .render(Rect::new(inner.x + inner.width - 6, y_offset + 2, 6, 1), buf);
             
-            // Free line
-            Paragraph::new(format!("Free: {:.0}%", free_percent))
-                .style(Style::default().fg(Color::Green))
-                .render(Rect::new(inner.x, y_offset + 3, 10, 1), buf);
+            y_offset += DISK_ENTRY_HEIGHT; // Move to free section
             
+            // Free line (label and value on one line)
+            Paragraph::new("Free:")
+                .style(Style::default().fg(Color::White))
+                .render(Rect::new(inner.x, y_offset, inner.width / 2, 1), buf);
+                
+            Paragraph::new(format!("{:.1} GiB", free))
+                .style(Style::default().fg(Color::White))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x + inner.width / 2, y_offset, inner.width / 2, 1), buf);
+            
+            // Free gauge (gauge and percentage on next line)
             render_braille_gauge(
-                Rect::new(inner.x + 10, y_offset + 3, inner.width.saturating_sub(20), 1),
+                Rect::new(inner.x, y_offset + 1, inner.width - 6, 1),
                 free_percent / 100.0,
                 Color::Green,
                 buf
             );
             
-            Paragraph::new(format!("{:.1} GiB", free))
-                .style(Style::default().fg(Color::Gray))
+            Paragraph::new(format!("{:>3.0}%", free_percent))
+                .style(Style::default().fg(Color::Green))
                 .alignment(Alignment::Right)
-                .render(Rect::new(inner.x + inner.width.saturating_sub(10), y_offset + 3, 10, 1), buf);
+                .render(Rect::new(inner.x + inner.width - 6, y_offset + 1, 6, 1), buf);
             
-            y_offset += DISK_ENTRY_HEIGHT + 1; // Add spacing between entries
+            y_offset += DISK_ENTRY_HEIGHT; // Add spacing for next disk
         }
         
         // Then render swap if it exists
@@ -1380,44 +1398,35 @@ impl<'a> Widget for DiskGauges<'a> {
             let used_percent = if total_swap > 0.0 { (used_swap / total_swap) * 100.0 } else { 0.0 };
             let free_percent = 100.0 - used_percent;
             
-            // Title line
-            Paragraph::new(format!("swap {:.2} GiB", total_swap))
+            // Swap title line
+            Paragraph::new(Line::from(vec![
+                Span::styled("swap: ", Style::default().fg(Color::White)),
+                Span::styled(format!("{:.1} GiB", total_swap), Style::default().fg(Color::White)),
+            ]))
+            .render(Rect::new(inner.x, y_offset, inner.width, 1), buf);
+            
+            // Used line (label and value on one line)
+            Paragraph::new("Used:")
                 .style(Style::default().fg(Color::White))
-                .render(Rect::new(inner.x, y_offset, inner.width, 1), buf);
+                .render(Rect::new(inner.x, y_offset + 1, inner.width / 2, 1), buf);
+                
+            Paragraph::new(format!("{:.1} GiB", used_swap))
+                .style(Style::default().fg(Color::White))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x + inner.width / 2, y_offset + 1, inner.width / 2, 1), buf);
             
-            // Used line
-            Paragraph::new(format!("Used: {:.0}%", used_percent))
-                .style(Style::default().fg(Color::Red))
-                .render(Rect::new(inner.x, y_offset + 1, 10, 1), buf);
-            
+            // Used gauge (gauge and percentage on next line)
             render_braille_gauge(
-                Rect::new(inner.x + 10, y_offset + 1, inner.width.saturating_sub(20), 1),
+                Rect::new(inner.x, y_offset + 2, inner.width - 6, 1),
                 used_percent / 100.0,
                 Color::Red,
                 buf
             );
             
-            Paragraph::new(format!("{:.1} GiB", used_swap))
-                .style(Style::default().fg(Color::Gray))
+            Paragraph::new(format!("{:>3.0}%", used_percent))
+                .style(Style::default().fg(Color::Red))
                 .alignment(Alignment::Right)
-                .render(Rect::new(inner.x + inner.width.saturating_sub(10), y_offset + 1, 10, 1), buf);
-            
-            // Free line
-            Paragraph::new(format!("Free: {:.0}%", free_percent))
-                .style(Style::default().fg(Color::Green))
-                .render(Rect::new(inner.x, y_offset + 2, 10, 1), buf);
-            
-            render_braille_gauge(
-                Rect::new(inner.x + 10, y_offset + 2, inner.width.saturating_sub(20), 1),
-                free_percent / 100.0,
-                Color::Green,
-                buf
-            );
-            
-            Paragraph::new(format!("{:.1} GiB", total_swap - used_swap))
-                .style(Style::default().fg(Color::Gray))
-                .alignment(Alignment::Right)
-                .render(Rect::new(inner.x + inner.width.saturating_sub(10), y_offset + 2, 10, 1), buf);
+                .render(Rect::new(inner.x + inner.width - 6, y_offset + 2, 6, 1), buf);
         }
     }
 }
@@ -1508,7 +1517,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         ]).areas(cpu);
 
         let [mem, disk] = Layout::vertical([
-            Constraint::Fill(1),
+            Constraint::Fill(2),
             Constraint::Fill(1)
         ]).areas(mem_disk);
 
@@ -1541,22 +1550,6 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
     }
 }
 
-
- 
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
- 
-
-    Rect {
-
-        x: (area.width - width) / 2,
-        y: (area.height - height) / 2,
-        width,
-        height,
-    }
- 
-
-}
 
 // Extension for colors to create darker/lighter variants
 trait ColorExt {
