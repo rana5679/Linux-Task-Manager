@@ -1,30 +1,42 @@
 use std::cell::RefCell;
-use std::io::{stdout};
 use std::rc::Rc;
 use sysinfo::{System, Pid};
 use std::io;
 use std::fs;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers,DisableMouseCapture,EnableMouseCapture},
-    execute,
-    terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-    },
-};
+use crossterm::event::{Event, KeyCode};
 use ratatui::{
     layout::*, style::{Color, Modifier, Style}, symbols, text::{Line, Span,Text}, widgets::*, Frame,
-    buffer::Buffer, backend::CrosstermBackend,   widgets::{Block, Borders, Paragraph},
-    Terminal,
+    buffer::Buffer, widgets::{Block, Borders, Paragraph},
 };
 use std::path::Path;
-use nix::errno::Errno;
-use procfs::{process::Process, ProcResult, WithCurrentSystemInfo, Uptime, Current};
-use nix::sys::{self, signal::{kill, Signal}};
+use procfs::{process::Process, ProcResult};
+use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid as NixPid;
-use libc::{getpriority, PRIO_PROCESS, pid_t, c_int, syscall, SYS_tgkill,setpriority};
+use libc::{getpriority, PRIO_PROCESS, c_int, syscall, SYS_tgkill,setpriority};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
-use chrono::{NaiveDateTime, Local, TimeZone};
+use std::time::Instant;
+use chrono::{Local, TimeZone};
+
+
+// btop-like colors
+const MEM_USED_COLOR: Color = Color::Rgb(220, 70, 70); // red
+const MEM_AVAILABLE_COLOR: Color = Color::Rgb(60, 180, 60);  // green
+const MEM_CACHED_COLOR: Color = Color::Rgb(255, 215, 40); // yellow
+const MEM_FREE_COLOR: Color = Color::Rgb(60, 150, 250); // light blue
+const PROCESS_NAME_COLOR: Color = Color::Rgb(235, 190, 255); // purple 1
+const TREE_COLOR: Color = Color::Rgb(0, 180, 180); // purple 2
+const HEADER_COLOR: Color = Color::Rgb(0, 180, 180); // teal
+// const TITLE_COLOR: Color = Color::Rgb(255, 215, 40); // gold
+const BACKGROUND: Color = Color::Rgb(10, 10, 10);        // black
+const DISK_USED_COLOR: Color = Color::Rgb(191, 64, 191);       // Red
+const DISK_FREE_COLOR: Color = Color::Rgb(70, 200, 70);       // Green
+const LIGHT_GREEN: Color = Color::Rgb(184, 226, 184);
+const DARK_GREEN: Color = Color::Rgb(184, 226, 184);
+const YELLOW: Color = Color::Rgb(238, 238, 155);
+const ORANGE: Color = Color::Rgb(255, 180, 100);
+const LIGHT_RED: Color = Color::Rgb(250, 120, 125); 
+const RED: Color = Color::Rgb(244, 80, 80);   
+
 
 #[derive(Eq, PartialEq)]
 // struct representing each process and its information
@@ -75,7 +87,7 @@ impl TreeProc {
     }
 
     // gets the number of children for a process
-    fn get_numchildren(&self) -> usize {
+    fn _get_numchildren(&self) -> usize {
         self.children.len()
     }
     
@@ -91,7 +103,7 @@ impl TreeProc {
 }
 
 // creates a vector of Treeprocs and fills the in the information about each process
-fn Tree_create() -> Vec<Rc<RefCell<TreeProc>>> {
+fn tree_create() -> Vec<Rc<RefCell<TreeProc>>> {
     let mut system = System::new_all();
     system.refresh_all();
 
@@ -129,7 +141,7 @@ fn find_root(process_arr: &Vec<Rc<RefCell<TreeProc>>>) -> Option<usize> {
 }
 
 // creates the tree display of processes 
-fn Tree_display(
+fn tree_display(
     process_arr: Vec<Rc<RefCell<TreeProc>>>,  // Take ownership of the vector
     indent: usize,
     current: u32,
@@ -149,7 +161,7 @@ fn Tree_display(
                 Span::styled(
                     format!("{}", curr_proc.get_pid()),
                     Style::default()
-                        .fg(Color::LightCyan)
+                        .fg(TREE_COLOR)
                         .add_modifier(Modifier::BOLD),
                 ),
             ])
@@ -164,7 +176,7 @@ fn Tree_display(
         
         let children = curr_proc.get_children();
         // recursively calls the function to display all the processes
-        let children_text = Tree_display(children, indent + 1, current,sel);
+        let children_text = tree_display(children, indent + 1, current,sel);
         tree_levels.extend(children_text);
     }
 
@@ -227,18 +239,11 @@ struct AppState {
     show_help: bool,        // Added for help panel toggle
     killed_pids: Vec<Pid>, // Track killed processes
     cpu_graph: Vec<(f64, f64)>, // track data points for graph 1
-    memory_data: Vec<(f64, f64)>,    // Memory usage over time
-    swap_data: Vec<(f64, f64)>,      // Swap usage over time
-    disk_data: Vec<(f64, f64)>,      // Disk usage over time
-    proc_tree: Vec<Rc<RefCell<TreeProc>>>, // contains the vector of processes with their children
     root_proc: Rc<RefCell<TreeProc>>, // gets the root process and its children
     curr_sel: u32, // gets the pid of the selected process
     thread_process_pid: Pid, // stores the process whose thread data is being displayed 
     thread_samples: HashMap<i32,ThreadSample>,
     latest_thread_count: usize,
-    renice_prompt: bool,
-    renice_input: String,
-    renice_error: Option<String>,
     sel: bool, // used to identify which process is selected for killing
     scroll_offset: usize,
 
@@ -248,7 +253,6 @@ impl AppState {
   fn new(
         proc_show_count: usize,
         thread_show_count: usize,
-        proc_tree: Vec<Rc<RefCell<TreeProc>>>,
         root_proc: Rc<RefCell<TreeProc>>,
         curr_sel: u32,
     ) -> Self {
@@ -268,30 +272,23 @@ impl AppState {
             show_help: false,
             killed_pids: Vec::new(),
             cpu_graph: Vec::new(),
-            memory_data: Vec::new(),
-            swap_data: Vec::new(),
-            disk_data: Vec::new(),
-            proc_tree,
             root_proc,
             curr_sel,
             thread_process_pid: Pid::from(1),
             thread_samples: HashMap::new(),
             latest_thread_count: 1,
-            renice_prompt: false,
-            renice_input: String::new(),
-            renice_error: None,
             sel: false,
             scroll_offset: 0,
         }
     }
 
-    fn scroll_down(&mut self, total_processes: usize) {
+    fn _scroll_down(&mut self, total_processes: usize) {
         if self.proc_scroll_position + self.proc_show_count < total_processes {
             self.proc_scroll_position += 1;
         }
     }
 
-    fn scroll_up(&mut self) {
+    fn _scroll_up(&mut self) {
         if self.proc_scroll_position > 0 {
             self.proc_scroll_position -= 1;
         }
@@ -393,6 +390,61 @@ impl AppState {
     }
 }
 
+fn percent_color(percent: f64) -> Color{
+    if percent <= 25.0
+    {
+        LIGHT_GREEN
+    }
+    else if percent <= 50.0 
+    {
+        DARK_GREEN
+    }
+    else if percent <= 70.0 
+    {
+        YELLOW
+    }
+    else if percent <= 85.0
+    {
+        ORANGE
+    }
+    else if percent <= 100.0
+    {
+        LIGHT_RED
+    }
+    else {
+        RED
+    }
+}
+
+fn thread_color(count: usize) -> Color{
+    if count <= 100
+    {
+        LIGHT_GREEN
+    }
+    else if count <= 200
+    {
+        YELLOW
+    }
+    else if count <= 300
+    {
+        ORANGE
+    }
+    else {
+        RED
+    }
+}
+
+fn disk_color(bytes_per_sec: u64) -> Color {
+    if bytes_per_sec <= 100_000_000 {
+        LIGHT_GREEN
+    } else if bytes_per_sec <= 300_000_000 {
+        YELLOW
+    } else if bytes_per_sec <= 500_000_000 {
+        ORANGE
+    } else {
+        RED
+    }
+}
 // Function to send signals to the selected process
 fn send_signal_to_selected_process(
     sys: &System,
@@ -478,50 +530,75 @@ fn renice_process(pid: Pid, new_nice: i32) -> Result<(), String> {
  
 
 
-fn help_panel<'a>() -> Paragraph<'a> {
-    let left_text = vec![
-        Line::from(Span::styled(
-            "Process Management:",
+
+fn help_panel<'a>() -> Table<'a> {
+    // Define the headers for each column
+    let header = Row::new(vec![
+        Cell::from(Span::styled(
+            "Process/Thread Management",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )),
-        Line::from("  K: Kill"),
-        Line::from("  U: Force Kill"),
-        Line::from("  S: Suspend"),
-        Line::from("  R: Resume"),
-        Line::from("  Shift +: Renice Process"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Navigation:",
+        Cell::from(Span::styled(
+            "Navigation",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
-        Line::from("  ↑/↓: Select Process"),
-        Line::from("  PgUp/PgDn: Page Navigation"),
-    ];
-
-    let right_text = vec![
-        Line::from(Span::styled(
-            "Sorting:",
+        Cell::from(Span::styled(
+            "Sorting / Other",
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         )),
-        Line::from("  C: Sort by CPU Usage"),
-        Line::from("  M: Sort by Memory Usage"),
-        Line::from("  P: Sort by PID"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Other:",
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-        )),
-        Line::from("  F: Freeze Display"),
-        Line::from("  Q: Quit Application"),
+    ]);
+
+    // Define the rows for each command (aligning by row index)
+    let rows = vec![
+        Row::new(vec![
+            Cell::from("K: Force Kill"),
+            Cell::from("↑/↓: Scroll Tree/Select Process/Thread"),
+            Cell::from("1: Sort by CPU Usage"),
+        ]),
+        Row::new(vec![
+            Cell::from("U: Kill"),
+            Cell::from("PgUp/PgDn: Page Navigation"),
+            Cell::from("2: Sort by Memory Usage [PROC] or Prio [THR]"),
+        ]),
+        Row::new(vec![
+            Cell::from("P: Suspend"),
+            Cell::from("←/→ : Switch Between Processes and Threads"),
+            Cell::from("3: Sort by PID/TID"),
+        ]),
+        Row::new(vec![
+            Cell::from("R: Resume"),
+            Cell::from("T: Switch to Tree Mode"),
+            Cell::from(Span::styled(
+                "Other",
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            )),
+        ]),
+        Row::new(vec![
+            Cell::from("+: Renice Selected Process"),
+            Cell::from(Span::styled(
+                "Tree Selection",
+                Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+            )),
+            Cell::from("F: Freeze Display"),
+        ]),
+        Row::new(vec![
+            Cell::from("→ : Show Thread Data for Selected Process"),
+            Cell::from("S: Select Process"),
+            Cell::from("Q: Quit Application"),
+        ]),
+        Row::new(vec![
+            Cell::from(""),
+            Cell::from("D: Deselect Process"),
+            Cell::from(""),
+        ]),
+        
     ];
 
-    let combined_text = left_text
-        .into_iter()
-        .chain(vec![Line::from("")]) // Add a blank line between columns
-        .chain(right_text)
-        .collect::<Vec<Line>>();
-
-    Paragraph::new(combined_text)
+    Table::new(rows,
+        &[ratatui::layout::Constraint::Percentage(33), 
+        ratatui::layout::Constraint::Percentage(33),
+        ratatui::layout::Constraint::Percentage(34)])
+        .header(header)
         .block(
             Block::default()
                 .title(Span::styled(
@@ -532,8 +609,10 @@ fn help_panel<'a>() -> Paragraph<'a> {
                 ))
                 .borders(Borders::ALL),
         )
-        .wrap(Wrap { trim: true })
+
+        .column_spacing(2)
 }
+
 
 fn format_uptime(seconds: u64) -> String {
     let days = seconds / 86400;
@@ -549,7 +628,7 @@ fn format_uptime(seconds: u64) -> String {
     }
 }
 
-fn system_info(sys: &sysinfo::System) -> Table {
+fn system_info(_sys: &sysinfo::System) -> Table {
     let sys_titles = vec![
     "System Name:",
     "System Kernel Version:",
@@ -577,8 +656,8 @@ fn system_info(sys: &sysinfo::System) -> Table {
 
 
     Table::new(rows,
-        &[ratatui::layout::Constraint::Percentage(15), 
-        ratatui::layout::Constraint::Percentage(85)])
+        &[ratatui::layout::Constraint::Length(25), 
+        ratatui::layout::Constraint::Length(25)])
         .block(
             Block::default()
                 .title(Span::styled(
@@ -589,7 +668,7 @@ fn system_info(sys: &sysinfo::System) -> Table {
                    
 }
 
-fn usage_info(sys: &sysinfo::System) -> Table {
+fn _usage_info(sys: &sysinfo::System) -> Table {
     let sys_titles = vec![
     "Total Memory:",
     "Used Memory:",
@@ -625,15 +704,16 @@ fn usage_info(sys: &sysinfo::System) -> Table {
 
 fn cpu_info(sys: &sysinfo::System) -> Table{
 
-    let mut rows: Vec<Row> = sys.cpus().chunks(1).enumerate().map(|(chunk_idx, chunk)|{
+    let rows: Vec<Row> = sys.cpus().chunks(1).enumerate().map(|(chunk_idx, chunk)|{
         
         let mut cells = Vec::new();
 
-        for(i, cpu) in chunk.iter().enumerate(){
+        for(_i, cpu) in chunk.iter().enumerate(){
             //let idx = chunk_idx * 2 + i;
             let idx = chunk_idx;
             cells.push(Cell::from(Span::raw(format!("CPU {}:", idx))));
-            cells.push(Cell::from(Span::raw(format!("{:.2}%", cpu.cpu_usage()))));
+            cells.push(Cell::from(Span::styled(format!("{:.2}%", cpu.cpu_usage()),
+                            Style::default().fg(percent_color(cpu.cpu_usage() as f64)))));
         }
         
         Row::new(cells)
@@ -641,8 +721,9 @@ fn cpu_info(sys: &sysinfo::System) -> Table{
     }).collect();
 
     let footer = Row::new(vec![
-        Cell::from(Span::raw("Average CPU Usage")),
-        Cell::from(Span::raw(format!("{:.2}%", sys.global_cpu_usage()))),
+        Cell::from(Span::raw("Average CPU%")),
+        Cell::from(Span::styled(format!("{:.2}%", sys.global_cpu_usage()),
+                    Style::default().fg(percent_color(sys.global_cpu_usage() as f64)))),
     ]);
 
     // go back to see dimensions
@@ -700,7 +781,7 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
     };
     
     // Get number of CPU cores for normalization
-    let cpu_count = sys.cpus().len() as f32;
+    let _cpu_count = sys.cpus().len() as f32;
     
     // Calculate visible range based on scroll position
     let total = pids.len();
@@ -759,18 +840,37 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
 
                 let total_mem = sys.total_memory() as f64;
                 Row::new(vec![
-                    pid.to_string(),
-                    proc.name().to_string_lossy().to_string(),
-                    unsafe { getpriority(PRIO_PROCESS, pid.as_u32()) }.to_string(),
-                    prio.to_string(),
-                    status,  // Display custom status here
-                    format!("{:.2}%", proc.cpu_usage()),
-                    format!("{:.2}%", (proc.memory() as f64 / total_mem) * 100.0 ),
-                    start_time_str,
-                    cpu_time_str,                  
-                    disk_read_str,
-                    disk_write_str,
-                    thread_count.to_string(), 
+                    Cell::from(pid.to_string()),
+                    Cell::from(Span::styled(
+                        proc.name().to_string_lossy().to_string(),
+                        Style::default().fg(PROCESS_NAME_COLOR)
+                    )),
+                    
+                    Cell::from(unsafe { getpriority(PRIO_PROCESS, pid.as_u32()) }.to_string()),
+                    Cell::from(prio.to_string()),
+                    Cell::from(status), // Display custom status here
+                    Cell::from(Span::styled(
+                        format!("{:.2}%", proc.cpu_usage()),
+                        Style::default().fg(percent_color(proc.cpu_usage() as f64)),
+                    )),
+                    Cell::from(Span::styled(
+                        format!("{}", (bytes_to_human(proc.memory()))),
+                        Style::default().fg(percent_color(proc.memory() as f64 / total_mem * 100.0))
+                    )),
+                    Cell::from(start_time_str),
+                    Cell::from(cpu_time_str),
+                    Cell::from(Span::styled(
+                        disk_read_str,
+                        Style::default().fg(disk_color(disk_usage.total_read_bytes))
+                    )),
+                    Cell::from(Span::styled(
+                        disk_write_str,
+                        Style::default().fg(disk_color(disk_usage.total_written_bytes))
+                    )),
+                    Cell::from(Span::styled(
+                        thread_count.to_string(),
+                        Style::default().fg(thread_color(thread_count))
+                    ))
                 ]).style(style)
             })
         })
@@ -792,7 +892,7 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
     };
 
     let header_style = Style::default()
-        .fg(Color::LightCyan)
+        .fg(HEADER_COLOR)
         .add_modifier(Modifier::BOLD);
     
     Table::new(rows, [
@@ -823,13 +923,18 @@ fn process_list<'a>(sys: &'a sysinfo::System, state: &'a mut AppState) -> Table<
         "Disk Write".to_string(),
         "Threads".to_string(),
     ]).style(header_style.add_modifier(Modifier::BOLD)))
-    .block(Block::default().title(format!(
-        "Processes [{}] [Sort: {}{}]{}",
-        total,
-        proc_sort_mode,
-        freeze_status,
-        f_key_info
-    )).borders(Borders::ALL))
+    .block(Block::default()
+    .title(
+        Span::styled(
+            format!(
+                "Processes [{}] [Sort: {}{}]{}",
+                total,
+                proc_sort_mode,
+                freeze_status,
+                f_key_info),
+            Style::default().add_modifier(Modifier::BOLD))
+)
+    .borders(Borders::ALL))
     .column_spacing(1)
 }
 
@@ -867,15 +972,24 @@ fn get_overall_process_data<'a>(sys: &'a sysinfo::System, app: &'a mut AppState)
     let rows = vec![
         Row::new(vec![
             Cell::from("Process name".to_string()),
-            Cell::from(name),
+            Cell::from(Span::styled(
+                name,
+                PROCESS_NAME_COLOR
+            )),
         ]),
         Row::new(vec![
             Cell::from("Thread count".to_string()),
-            Cell::from(thread_count.to_string()),
+            Cell::from(Span::styled(
+                thread_count.to_string(),
+                thread_color(thread_count)
+            )),
         ]),
         Row::new(vec![
             Cell::from("Memory".to_string()),
-            Cell::from(bytes_to_human(memory)),
+            Cell::from(Span::styled(
+                format!("{}", (bytes_to_human(memory))),
+                Style::default().fg(percent_color(memory as f64 / sys.total_memory() as f64 * 100.0))
+            )),
         ]),
     ];
 
@@ -981,7 +1095,7 @@ fn thread_info_to_table<'a>(state: &'a mut AppState) -> Table<'a>{
     };
 
     let header_style = Style::default()
-        .fg(Color::LightCyan)
+        .fg(HEADER_COLOR)
         .add_modifier(Modifier::BOLD);
 
     let start = state.thread_scroll_position;
@@ -1003,9 +1117,14 @@ fn thread_info_to_table<'a>(state: &'a mut AppState) -> Table<'a>{
 
         Row::new(vec![
             Cell::from(t.tid.to_string()),
-            Cell::from(t.name.clone()),
+            Cell::from(Span::styled(
+                t.name.clone(),
+                PROCESS_NAME_COLOR
+            )),
             Cell::from(t.state.clone()),
-            Cell::from(format!("{:.2}%", t.cpu)),
+            Cell::from(Span::styled(format!("{:.2}%", t.cpu),
+            Style::default().fg(percent_color(t.cpu))
+            )),
             Cell::from(t.priority.to_string()),
         ]).style(style)
         }).collect();
@@ -1021,11 +1140,13 @@ fn thread_info_to_table<'a>(state: &'a mut AppState) -> Table<'a>{
             Row::new(vec!["TID", "Name", "State", "CPU%", "Prio"])
                 .style(header_style)
         )
-        .block(Block::default().title(format!(
-            "Thread Data [Sort: {}]",
-            sort_mode,
-        )).borders(Borders::ALL)
+        .block(Block::default()
+        .title(
+                Span::styled(
+                    format!("Thread Data [Sort: {}]", sort_mode),
+                    Style::default().add_modifier(Modifier::BOLD))
         )
+        .borders(Borders::ALL))
         .column_spacing(1)
             
 }
@@ -1058,6 +1179,7 @@ fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect
     let new_y = sys.global_cpu_usage() as f64;
 
     app.cpu_graph.push((new_x, new_y));
+    let percent = new_y;
 
     let width = area.width;
     
@@ -1076,7 +1198,7 @@ fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect
     .data(&app.cpu_graph)
     .graph_type(GraphType::Bar)
     .marker(symbols::Marker::Braille)
-    .style(Style::default().fg(Color::Rgb(255, 215, 0)).bg(Color::Rgb(100, 75, 100)));
+    .style(Style::default().fg(percent_color(percent)).bg(Color::Rgb(100, 75, 100)));
 
     // Configure axes
     let x_axis = Axis::default()
@@ -1094,7 +1216,7 @@ fn get_cpu_graph<'a>(sys: &'a sysinfo::System, app: &'a mut AppState, area: Rect
             Block::default()
                 .borders(Borders::ALL)
                 .title("CPU %"))
-        .style(Style::default().bg(BACKGROUND))
+        .style(Style::default().bg(BACKGROUND).add_modifier(Modifier::BOLD))
 
 }
 struct MemoryGauges<'a> {
@@ -1150,10 +1272,10 @@ fn get_btop_memory_stats() -> (f64, f64, f64, f64, f64) {
         memfree / kb_to_gib           // free
     )
 }
-
+     
 
 impl<'a> MemoryGauges<'a> {
-    fn new(sys: &sysinfo::System) -> Self {
+    fn new(_sys: &sysinfo::System) -> Self {
         let (total_mem, used_mem, available_mem, cached_mem, free_mem) = get_btop_memory_stats();
         Self {
             total_mem,
@@ -1164,18 +1286,10 @@ impl<'a> MemoryGauges<'a> {
             block: Block::default()
                 .title("Mem")
                 .borders(Borders::ALL)
-                .style(Style::default().add_modifier(Modifier::BOLD).bg(Color::Rgb(3, 25, 35))),
+                .style(Style::default().add_modifier(Modifier::BOLD).bg(BACKGROUND)),
         }
     }
 }
-// btop-like colors
-const MEM_USED_COLOR: Color = Color::Rgb(250, 175, 200);       // Red
-const MEM_AVAILABLE_COLOR: Color = Color::Rgb(224, 176, 255);  // Yellow
-const MEM_CACHED_COLOR: Color = Color::Rgb(218, 112, 214);      // Blue
-const MEM_FREE_COLOR: Color = Color::Rgb(153, 85, 187);        // Green
-const BACKGROUND: Color = Color::Rgb(8, 25, 35);        // Yellow
-const DISK_USED_COLOR: Color = Color::Rgb(220, 70, 70);       // Red
-const DISK_FREE_COLOR: Color = Color::Rgb(70, 200, 70);       // Green
 
 impl<'a> Widget for MemoryGauges<'a> {
     fn render(self, rect: Rect, buf: &mut Buffer) {
@@ -1286,7 +1400,7 @@ fn render_braille_gauge(area: Rect, ratio: f64, color: Color, buf: &mut Buffer) 
     }
 }
 
-fn render_disk_line(
+fn _render_disk_line(
     area: Rect,
     label: &str,
     percent: f64,
@@ -1354,12 +1468,12 @@ impl<'a> Widget for DiskGauges<'a> {
             render_braille_gauge(
                 Rect::new(inner.x, y_offset + 2, inner.width - 6, 1),
                 used_percent / 100.0,
-                MEM_USED_COLOR,
+                DISK_FREE_COLOR,
                 buf
             );
             
             Paragraph::new(format!("{:>3.0}%", used_percent))
-                .style(Style::default().fg(MEM_USED_COLOR))
+                .style(Style::default().fg(DISK_USED_COLOR))
                 .alignment(Alignment::Right)
                 .render(Rect::new(inner.x + inner.width - 6, y_offset + 2, 6, 1), buf);
             
@@ -1379,12 +1493,12 @@ impl<'a> Widget for DiskGauges<'a> {
             render_braille_gauge(
                 Rect::new(inner.x, y_offset + 1, inner.width - 6, 1),
                 free_percent / 100.0,
-                Color::Green,
+                DISK_FREE_COLOR,
                 buf
             );
             
             Paragraph::new(format!("{:>3.0}%", free_percent))
-                .style(Style::default().fg(Color::Green))
+                .style(Style::default().fg(DISK_FREE_COLOR))
                 .alignment(Alignment::Right)
                 .render(Rect::new(inner.x + inner.width - 6, y_offset + 1, 6, 1), buf);
             
@@ -1419,14 +1533,35 @@ impl<'a> Widget for DiskGauges<'a> {
             render_braille_gauge(
                 Rect::new(inner.x, y_offset + 2, inner.width - 6, 1),
                 used_percent / 100.0,
-                Color::Red,
+                DISK_USED_COLOR,
                 buf
             );
-            
             Paragraph::new(format!("{:>3.0}%", used_percent))
-                .style(Style::default().fg(Color::Red))
+                .style(Style::default().fg(DISK_USED_COLOR))
                 .alignment(Alignment::Right)
                 .render(Rect::new(inner.x + inner.width - 6, y_offset + 2, 6, 1), buf);
+
+
+            Paragraph::new(format!("Free: {:.0}%", free_percent))
+                .style(Style::default().fg(Color::White))
+                .render(Rect::new(inner.x, y_offset + 2, 10, 1), buf);
+
+            Paragraph::new(format!("{:.1} GiB", total_swap - used_swap))
+                .style(Style::default().fg(Color::White))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x + inner.width.saturating_sub(10), y_offset + 2, 10, 1), buf);
+            
+            render_braille_gauge(
+                Rect::new(inner.x + 10, y_offset + 2, inner.width.saturating_sub(20), 1),
+                free_percent / 100.0,
+                Color::Green,
+                buf
+            );
+            Paragraph::new(format!("{:>3.0}%", free_percent))
+                .style(Style::default().fg(Color::White))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x + inner.width - 6, y_offset + 2, 6, 1), buf);
+            
         }
     }
 }
@@ -1447,8 +1582,8 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
     // If tree mode is enabled, draw tree and return early
     if tree {
        let tree_proc = vec![Rc::clone(&state.root_proc)];
-        //let tree_text = Tree_display(tree_proc, 0, state.curr_sel,state.sel);
-        let all_lines = Tree_display(tree_proc, 0, state.curr_sel,state.sel);
+        //let tree_text = tree_display(tree_proc, 0, state.curr_sel,state.sel);
+        let all_lines = tree_display(tree_proc, 0, state.curr_sel,state.sel);
         let area_height = area.height.saturating_sub(2) as usize; // account for border
         let total_lines = all_lines.len();
 
@@ -1465,35 +1600,6 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         return;
     }
 
-    if state.show_help {
-        // For help layout: calculate available space after system stats and help panel
-        let available_height = area.height.saturating_sub(12 + 20 + 3);
-        state.proc_show_count = available_height as usize;
-
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(12),  // System stats
-                Constraint::Length(20),  // Help panel 
-                Constraint::Min(5),      // Process list
-            ])
-            .split(area);
-
-        let upper_list_layout = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(vec![
-                Constraint::Percentage(36),
-                Constraint::Percentage(25),
-                Constraint::Percentage(39),
-            ])
-            .split(layout[0]);
-
-        frame.render_widget(system_info(&sys), upper_list_layout[0]);
-        frame.render_widget(usage_info(&sys), upper_list_layout[1]);
-        frame.render_widget(cpu_info(&sys), upper_list_layout[2]);
-        frame.render_widget(help_panel(), layout[1]);
-        frame.render_widget(process_list(&sys, state), layout[2]);
-    } else {
         
         let [top, middle, bottom] = Layout::vertical([
             Constraint::Fill(1),
@@ -1501,9 +1607,9 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
             Constraint::Fill(3)
         ]).areas(area);
 
-        let [systeminfo, useageinfo] = Layout::horizontal([
+        let [systeminfo, help] = Layout::horizontal([
             Constraint::Fill(1),
-            Constraint::Fill(1)
+            Constraint::Fill(2)
         ]).areas(top);
 
         let [cpu, mem_disk] = Layout::horizontal([
@@ -1517,7 +1623,7 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         ]).areas(cpu);
 
         let [mem, disk] = Layout::vertical([
-            Constraint::Fill(2),
+            Constraint::Fill(1),
             Constraint::Fill(1)
         ]).areas(mem_disk);
 
@@ -1537,8 +1643,14 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
 
         let thread_section_height = (per_thread.height as f32).floor() as u16;
         state.thread_show_count = ((thread_section_height.saturating_sub(3)) as f64) as usize;
+        if state.show_help{
+        frame.render_widget(system_info(&sys), systeminfo);
+        frame.render_widget(help_panel(), help);
+        }
+
+        else{ 
         frame.render_widget(system_info(&sys), top);
-        // frame.render_widget(usage_info(&sys), useageinfo);
+        }
         frame.render_widget(cpu_info(&sys), cpus);
         frame.render_widget(get_cpu_graph(&sys, state, cpu_graph), cpu_graph);
         frame.render_widget(memory_gauges(&sys), mem);
@@ -1547,14 +1659,14 @@ fn draw_ui(sys: &sysinfo::System, state: &mut AppState, frame: &mut Frame, tree:
         frame.render_widget(get_overall_process_data(&sys, state), thread_general);
         frame.render_widget(thread_info_to_table(state), per_thread);
         
-    }
+
 }
 
 
 // Extension for colors to create darker/lighter variants
 trait ColorExt {
     fn darker(&self, amount: u8) -> Self;
-    fn lighter(&self, amount: u8) -> Self;
+    fn _lighter(&self, amount: u8) -> Self;
 }
 
 impl ColorExt for Color {
@@ -1571,7 +1683,7 @@ impl ColorExt for Color {
         }
     }
     
-    fn lighter(&self, amount: u8) -> Self {
+    fn _lighter(&self, amount: u8) -> Self {
         match self {
             Color::Rgb(r, g, b) => {
                 Color::Rgb(
@@ -1593,13 +1705,13 @@ fn main() -> io::Result<()> {
     let mut sys = System::new_all();
     
     
-   let processes_tree: Vec<Rc<RefCell<TreeProc>>> = Tree_create();
+   let processes_tree: Vec<Rc<RefCell<TreeProc>>> = tree_create();
    let root_index = find_root(&processes_tree).unwrap();
    let root_proc = Rc::clone(&processes_tree[root_index]); 
    let mut niceval;
 
 
-let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), root_proc.borrow().get_pid());
+let mut state = AppState::new(15, 15, Rc::clone(&root_proc), root_proc.borrow().get_pid());
 
     
     let mut tree:bool = false;
@@ -1629,13 +1741,13 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                     // Navigation keys
                     KeyCode::Char('q') => break,
                     KeyCode::Char('f') => state.toggle_freeze(),
-                    KeyCode::Char('c') => state.change_sort_mode(SortMode::Cpu),
-                    KeyCode::Char('m') => state.change_sort_mode(SortMode::Memory),
-                    KeyCode::Char('p') => state.change_sort_mode(SortMode::Pid),
+                    KeyCode::Char('1') => state.change_sort_mode(SortMode::Cpu),
+                    KeyCode::Char('2') => state.change_sort_mode(SortMode::Memory),
+                    KeyCode::Char('3') => state.change_sort_mode(SortMode::Pid),
                     
                      KeyCode::Left => {
                         if tree{
-                            state.scroll_offset += 1;
+                            state.scroll_offset = state.scroll_offset.saturating_sub(1);
                         }
                         else{
                           state.mode = Mode::Proc;
@@ -1644,10 +1756,18 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                     
                     KeyCode::Right => {
                         if tree{
-                            state.scroll_offset = state.scroll_offset.saturating_sub(1);
+                            
+                            state.scroll_offset += 1;
                         }
                        else {
                          state.mode = Mode::Thread;
+                         let pt_pid = selected_pid(&state);
+                            if Path::new(&format!("/proc/{}", pt_pid)).exists(){
+                                state.thread_process_pid = pt_pid;
+                                state.thread_scroll_position = 0;
+                                state.thread_selected_index = 0;
+                                state.cached_threads = None;
+                        }
                        }
                     },
                     
@@ -1686,7 +1806,7 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                     
                     // Process management
                     KeyCode::Char('h') => state.toggle_help(),
-                    KeyCode::Char('k') => {
+                    KeyCode::Char('u') => {
                         if tree{
                             for proc in &stack {
                                 if proc.borrow().get_selected() == true{
@@ -1702,7 +1822,7 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                         }
                       }
                     },
-                    KeyCode::Char('u') => {
+                    KeyCode::Char('k') => {
                         if state.mode == Mode::Proc {
                             if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGKILL) {
                                 eprintln!("Error sending SIGKILL: {}", e);
@@ -1725,6 +1845,11 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                             eprintln!("Error sending SIGSTOP: {}", e);
                             }
                         }
+                    },
+                    KeyCode::Char('p') => {
+                            if let Err(e) = send_signal_to_selected_process(&sys, &mut state, Signal::SIGSTOP) {
+                            eprintln!("Error sending SIGSTOP: {}", e);
+                            }
                     },
                     
                     KeyCode::Char('d') => {
@@ -1749,37 +1874,31 @@ let mut state = AppState::new(15, 15, processes_tree, Rc::clone(&root_proc), roo
                     },
                     
                     KeyCode::Char('+') => {
-                        let temp_pid = selected_pid(&state).as_u32();
-                        niceval = unsafe { getpriority(PRIO_PROCESS,temp_pid) };
-                        if niceval < 19{
-                            niceval += 1;
-                        }
-                        
-                        renice_process(selected_pid(&state), niceval);
+                        if state.mode == Mode::Proc{
+                            let temp_pid = selected_pid(&state).as_u32();
+                            niceval = unsafe { getpriority(PRIO_PROCESS,temp_pid) };
+                                if niceval < 19{
+                                    niceval += 1;
+                                    let _ = renice_process(selected_pid(&state), niceval);
+                                    }
+                            }
                     }
                     
                      KeyCode::Char('-') => {
-                        let temp_pid = selected_pid(&state).as_u32();
-                        niceval = unsafe { getpriority(PRIO_PROCESS, temp_pid) };
-                        if niceval > -20{
-                        niceval =  niceval - 1;
+                        if state.mode == Mode::Proc{
+                            let temp_pid = selected_pid(&state).as_u32();
+                            niceval = unsafe { getpriority(PRIO_PROCESS, temp_pid) };
+                            if niceval > -20{
+                                niceval =  niceval - 1;
+                            }
+                            
+                            let _ = renice_process(selected_pid(&state), niceval);
                         }
-                        
-                        renice_process(selected_pid(&state), niceval);
                     }
                     
                     KeyCode::Char('t') if key.modifiers.is_empty() => {
                         tree = !tree;
                         stack_proc(&mut stack, &state.root_proc.clone());
-                    },
-                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        let pt_pid = selected_pid(&state);
-                        if Path::new(&format!("/proc/{}", pt_pid)).exists(){
-                            state.thread_process_pid = pt_pid;
-                            state.thread_scroll_position = 0;
-                            state.thread_selected_index = 0;
-                            state.cached_threads = None;
-                        }
                     },
                     _ => {}
                 }
