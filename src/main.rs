@@ -1422,11 +1422,32 @@ impl<'a> Widget for DiskGauges<'a> {
                 Color::Red,
                 buf
             );
-            
             Paragraph::new(format!("{:>3.0}%", used_percent))
-                .style(Style::default().fg(Color::Red))
+                .style(Style::default().fg(Color::Green))
                 .alignment(Alignment::Right)
                 .render(Rect::new(inner.x + inner.width - 6, y_offset + 2, 6, 1), buf);
+
+
+            Paragraph::new(format!("Free: {:.0}%", free_percent))
+                .style(Style::default().fg(Color::White))
+                .render(Rect::new(inner.x, y_offset + 2, 10, 1), buf);
+
+            Paragraph::new(format!("{:.1} GiB", total_swap - used_swap))
+                .style(Style::default().fg(Color::White))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x + inner.width.saturating_sub(10), y_offset + 2, 10, 1), buf);
+            
+            render_braille_gauge(
+                Rect::new(inner.x + 10, y_offset + 2, inner.width.saturating_sub(20), 1),
+                free_percent / 100.0,
+                Color::Green,
+                buf
+            );
+            Paragraph::new(format!("{:>3.0}%", free_percent))
+                .style(Style::default().fg(Color::White))
+                .alignment(Alignment::Right)
+                .render(Rect::new(inner.x + inner.width - 6, y_offset + 2, 6, 1), buf);
+            
         }
     }
 }
